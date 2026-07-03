@@ -100,7 +100,7 @@ all: $(KRUNFW_BINARY_$(OS))
 
 $(KERNEL_TARBALL):
 	@mkdir -p tarballs
-	curl -fL $(KERNEL_REMOTE) -o $(KERNEL_TARBALL)
+	curl -fL --retry 5 --retry-delay 5 --retry-all-errors $(KERNEL_REMOTE) -o $(KERNEL_TARBALL)
 
 $(KERNEL_SOURCES): $(KERNEL_TARBALL)
 	tar xf $(KERNEL_TARBALL)
