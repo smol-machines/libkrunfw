@@ -1,4 +1,4 @@
-KERNEL_VERSION = linux-6.12.94
+KERNEL_VERSION = linux-6.12.95
 KERNEL_REMOTE = https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/snapshot/$(KERNEL_VERSION).tar.gz
 KERNEL_TARBALL = tarballs/$(KERNEL_VERSION).tar.xz
 KERNEL_SOURCES = $(KERNEL_VERSION)
