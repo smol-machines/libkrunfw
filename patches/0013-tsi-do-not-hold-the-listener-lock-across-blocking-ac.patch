@@ -1,0 +1,94 @@
+--- a/net/tsi/af_tsi.h
++++ b/net/tsi/af_tsi.h
+@@ -92,6 +92,11 @@
+ 	unsigned int status;
+ 	u32 svm_port;
+ 	u32 svm_peer_port;
++	/* Serializes the accept request/response pair on csocket without
++	 * holding the listener's sock lock across the blocking wait (holding
++	 * it deadlocks concurrent shutdown()/close() on the listener).
++	 */
++	struct mutex accept_lock;
+ 	struct sockaddr *bound_addr;
+ 	struct sockaddr *sendto_addr;
+ 	int bound_addr_len;
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -498,15 +498,22 @@
+ 	pr_debug("%s: sending accept request id=%u\n", __func__,
+ 		 ta_req.svm_port);
+ 
++	/* Serialize the request/response pair against concurrent accepts;
++	 * the listener's sock lock is NOT held here so that shutdown() and
++	 * close() stay callable while we block on the host.
++	 */
++	mutex_lock(&tsk->accept_lock);
+ 	err = tsi_control_sendmsg(tsk->csocket, TSI_ACCEPT, (void *)&ta_req,
+ 				  sizeof(struct tsi_accept_req));
+ 	if (err < 0) {
++		mutex_unlock(&tsk->accept_lock);
+ 		pr_debug("%s: error sending accept request\n", __func__);
+ 		return err;
+ 	}
+ 
+ 	err = tsi_control_recvmsg(tsk->csocket, TSI_ACCEPT, (void *)&ta_rsp,
+ 				  sizeof(struct tsi_accept_rsp));
++	mutex_unlock(&tsk->accept_lock);
+ 	if (err < 0) {
+ 		pr_debug("%s: error receiving accept response\n", __func__);
+ 		return err;
+@@ -551,6 +558,11 @@
+ 	struct sock *sk;
+ 	int err;
+ 
++	/* Snapshot the listener state under its lock, then RELEASE it before
++	 * any blocking work: the native inet accept path sleeps without the
++	 * sock lock, and holding it across the host round-trip deadlocks any
++	 * concurrent shutdown()/close() on the listener (both take it).
++	 */
+ 	lock_sock(listener);
+ 	tsk = tsi_sk(sock->sk);
+ 	isocket = tsk->isocket;
+@@ -570,9 +582,10 @@
+ 	} else {
+ 		panic("Unsupported family in tsk->family=%d", tsk->family);
+ 	}
++	release_sock(listener);
+ 	if (!sk) {
+ 		err = -ENOMEM;
+-		goto release;
++		return err;
+ 	}
+ 
+ 	sock_init_data(newsock, sk);
+@@ -580,6 +593,7 @@
+ 	set_bit(SOCK_CUSTOM_SOCKOPT, &sk->sk_socket->flags);
+ 
+ 	newtsk = tsi_sk(newsock->sk);
++	mutex_init(&newtsk->accept_lock);
+ 	newtsk->family = tsk->family;
+ 
+ 	if (tsk->status == S_INET) {
+@@ -623,14 +637,11 @@
+ 	newtsk->csocket = csocket;
+ 	newsock->state = SS_CONNECTED;
+ 
+-release:
+-	release_sock(listener);
+ 	return err;
+ 
+ error:
+ 	if (nsock)
+ 		sock_release(nsock);
+-	release_sock(listener);
+ 	return err;
+ }
+ 
+@@ -1504,6 +1515,7 @@
+ 	set_bit(SOCK_CUSTOM_SOCKOPT, &sk->sk_socket->flags);
+ 
+ 	tsk = tsi_sk(sk);
++	mutex_init(&tsk->accept_lock);
+ 
+ 	isocket = NULL;
+ 	err = __sock_create(current->nsproxy->net_ns, family, sock->type,
