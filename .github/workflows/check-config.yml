@@ -1,0 +1,11 @@
+name: Check required kernel config
+on: [push, pull_request]
+jobs:
+  check-config:
+    name: Required guest config symbols
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+      - name: Verify required guest kernel config symbols
+        run: sh scripts/check-required-config.sh
