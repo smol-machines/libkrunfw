@@ -131,7 +131,7 @@ new file mode 100644
 index 000000000000..3d2bcd8d2ba4
 --- /dev/null
 +++ b/net/tsi/af_tsi.c
-@@ -0,0 +1,1713 @@
+@@ -0,0 +1,1721 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +/*
 + * Transparent Socket Impersonation Driver
@@ -1185,17 +1185,25 @@ index 000000000000..3d2bcd8d2ba4
 +	case S_VSOCK:
 +		if (level == SOL_SOCKET) {
 +			/*
-+			 * The connection is now proxied via vsock, but
-+			 * callers can still query SOL_SOCKET options. Apply
-+			 * the option to isocket purely for kernel-side
-+			 * validation/canonicalization, then mirror onto the
-+			 * outer sock so getsockopt round-trips work.
++			 * The connection is now proxied via vsock, but callers
++			 * can still set SOL_SOCKET options. A connect-side
++			 * socket has a shadow inet socket to validate and
++			 * canonicalize the option against before mirroring it
++			 * onto the outer sock; an accept()ed vsock stream has no
++			 * such shadow (tsi_accept never creates one), so apply
++			 * the option straight to the outer sock rather than
++			 * dereferencing a NULL isocket and faulting.
 +			 */
-+			err = sock_setsockopt(isocket, level, optname, optval,
-+					      optlen);
-+			if (!err)
-+				tsi_mirror_sol_socket_field(sk, isocket->sk,
-+							    optname);
++			if (isocket) {
++				err = sock_setsockopt(isocket, level, optname,
++						      optval, optlen);
++				if (!err)
++					tsi_mirror_sol_socket_field(
++						sk, isocket->sk, optname);
++			} else {
++				err = sock_setsockopt(sock, level, optname,
++						      optval, optlen);
++			}
 +		} else {
 +			// TODO implement remote setsockopt
 +			err = 0;
