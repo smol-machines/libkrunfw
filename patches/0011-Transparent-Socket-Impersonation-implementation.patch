@@ -131,7 +131,7 @@ new file mode 100644
 index 000000000000..3d2bcd8d2ba4
 --- /dev/null
 +++ b/net/tsi/af_tsi.c
-@@ -0,0 +1,1656 @@
+@@ -0,0 +1,1713 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +/*
 + * Transparent Socket Impersonation Driver
@@ -458,6 +458,36 @@ index 000000000000..3d2bcd8d2ba4
 +	if (err != 0) {
 +		pr_debug("%s: invalid addr_len: %d\n", __func__, addr_len);
 +		err = -EINVAL;
++		goto release;
++	}
++
++	/*
++	 * Datagram connect: record the peer and stay in S_HYBRID so each send
++	 * is routed per-destination (a guest-local listener -> the inet stack,
++	 * anything external -> the vsock proxy), exactly like the sendto()
++	 * path. Committing a datagram socket to S_INET here (a UDP connect is
++	 * only a route lookup and always "succeeds" when a default route
++	 * exists) would route its packets through the guest's own network
++	 * stack, which has no egress from a non-initial netns such as a Docker
++	 * bridge container, stranding them. We still connect the shadow inet
++	 * socket so getpeername() and local delivery keep AF_INET semantics.
++	 */
++	if (sk->sk_type == SOCK_DGRAM) {
++		if (isocket)
++			isocket->ops->connect(isocket, addr, addr_len,
++					      flags & ~O_NONBLOCK);
++		if (!tsk->sendto_addr) {
++			tsk->sendto_addr = kmalloc(addr_len, GFP_KERNEL);
++			if (!tsk->sendto_addr) {
++				err = -ENOMEM;
++				goto release;
++			}
++			tsk->sendto_addr_len = addr_len;
++		}
++		memcpy(tsk->sendto_addr, addr, addr_len);
++		tsk->status = S_HYBRID;
++		sock->state = SS_CONNECTED;
++		err = 0;
 +		goto release;
 +	}
 +
@@ -832,7 +862,16 @@ index 000000000000..3d2bcd8d2ba4
 +		err = isocket->ops->getname(isocket, addr, peer);
 +		break;
 +	case S_VSOCK:
-+		if (peer) {
++		if (peer && sk->sk_type == SOCK_DGRAM &&
++		    sock->state == SS_CONNECTED && isocket) {
++			/*
++			 * A connected datagram socket keeps its AF_INET peer on
++			 * the shadow inet socket even once its data path has
++			 * latched to the vsock proxy; report that rather than the
++			 * proxy's AF_VSOCK peer, which userland would reject.
++			 */
++			err = isocket->ops->getname(isocket, addr, peer);
++		} else if (peer) {
 +			err = vsock_proxy_getname(tsk, addr, peer);
 +		} else if (isocket) {
 +			err = isocket->ops->getname(isocket, addr, peer);
@@ -1378,6 +1417,7 @@ index 000000000000..3d2bcd8d2ba4
 +{
 +	struct sock *sk = sock->sk;
 +	struct tsi_sendto_addr sa_req;
++	struct sockaddr_storage connected_peer;
 +	struct sockaddr_vm *svm;
 +	struct tsi_sock *tsk;
 +	struct socket *isocket;
@@ -1391,6 +1431,17 @@ index 000000000000..3d2bcd8d2ba4
 +
 +	pr_debug("%s: s=%p vs=%p is=%p st=%d family=%d\n", __func__, sock,
 +		 vsocket, isocket, tsk->status, tsk->family);
++
++	/*
++	 * A connected datagram socket sends with no msg_name; supply the peer
++	 * recorded at connect() time (on a private copy, since the vsock proxy
++	 * path rewrites msg_name in place) so the routing below has a target.
++	 */
++	if (!msg->msg_name && tsk->sendto_addr) {
++		memcpy(&connected_peer, tsk->sendto_addr, tsk->sendto_addr_len);
++		msg->msg_name = &connected_peer;
++		msg->msg_namelen = tsk->sendto_addr_len;
++	}
 +
 +	switch (tsk->status) {
 +	case S_INET:
