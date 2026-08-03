@@ -1807,7 +1807,7 @@ CONFIG_SECURITY_LANDLOCK=y
 # CONFIG_INTEGRITY is not set
 # CONFIG_DEFAULT_SECURITY_SELINUX is not set
 CONFIG_DEFAULT_SECURITY_DAC=y
-CONFIG_LSM="lockdown,yama,loadpin,safesetid,integrity,selinux,bpf"
+CONFIG_LSM="landlock,lockdown,yama,loadpin,safesetid,integrity,selinux,bpf"
 
 #
 # Kernel hardening options
