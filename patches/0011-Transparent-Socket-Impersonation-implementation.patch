@@ -131,7 +131,7 @@ new file mode 100644
 index 000000000000..3d2bcd8d2ba4
 --- /dev/null
 +++ b/net/tsi/af_tsi.c
-@@ -0,0 +1,1713 @@
+@@ -0,0 +1,1725 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +/*
 + * Transparent Socket Impersonation Driver
@@ -471,8 +471,16 @@ index 000000000000..3d2bcd8d2ba4
 +	 * stack, which has no egress from a non-initial netns such as a Docker
 +	 * bridge container, stranding them. We still connect the shadow inet
 +	 * socket so getpeername() and local delivery keep AF_INET semantics.
++	 *
++	 * Scoped to a non-initial namespace, which is the only place the
++	 * stranding happens. In the initial namespace connect() has to keep
++	 * reporting whether the destination is actually reachable, because a
++	 * resolver connects a datagram socket to each candidate address to
++	 * learn which family is usable (RFC 6724). Answering "reachable" for
++	 * every address there makes it sort IPv6 first on an IPv4-only host,
++	 * and every name-based connection then goes somewhere unreachable.
 +	 */
-+	if (sk->sk_type == SOCK_DGRAM) {
++	if (sk->sk_type == SOCK_DGRAM && sock_net(sk) != &init_net) {
 +		if (isocket)
 +			isocket->ops->connect(isocket, addr, addr_len,
 +					      flags & ~O_NONBLOCK);
@@ -1433,11 +1441,15 @@ index 000000000000..3d2bcd8d2ba4
 +		 vsocket, isocket, tsk->status, tsk->family);
 +
 +	/*
-+	 * A connected datagram socket sends with no msg_name; supply the peer
-+	 * recorded at connect() time (on a private copy, since the vsock proxy
-+	 * path rewrites msg_name in place) so the routing below has a target.
++	 * A hybrid connected datagram socket sends with no msg_name; supply the
++	 * peer recorded at connect() time (on a private copy, since the vsock
++	 * proxy path rewrites msg_name in place) so the per-destination routing
++	 * below has a target. Only for S_HYBRID: an S_VSOCK socket already has
++	 * a connected proxy flow, and naming a peer here re-routes its sends
++	 * through the sendto flow, whose replies never reach the socket — the
++	 * agent's own resolver then times out and image pulls fail at boot.
 +	 */
-+	if (!msg->msg_name && tsk->sendto_addr) {
++	if (tsk->status == S_HYBRID && !msg->msg_name && tsk->sendto_addr) {
 +		memcpy(&connected_peer, tsk->sendto_addr, tsk->sendto_addr_len);
 +		msg->msg_name = &connected_peer;
 +		msg->msg_namelen = tsk->sendto_addr_len;
