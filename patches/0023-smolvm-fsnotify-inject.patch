@@ -24,7 +24,7 @@ diff --git a/fs/notify/smolvm_inject.c b/fs/notify/smolvm_inject.c
 new file mode 100644
 --- /dev/null
 +++ b/fs/notify/smolvm_inject.c
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,127 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * smolvm_inject.c - inject fsnotify events for host-originated file changes.
@@ -52,10 +52,15 @@ new file mode 100644
 +#include <linux/proc_fs.h>
 +#include <linux/uaccess.h>
 +#include <linux/namei.h>
++#include <linux/dcache.h>
 +#include <linux/fsnotify.h>
 +#include <linux/fs.h>
++#include <linux/magic.h>
 +#include <linux/slab.h>
 +#include <linux/limits.h>
++#if IS_ENABLED(CONFIG_FUSE_FS)
++#include "../fuse/fuse_i.h"
++#endif
 +
 +/* Bound a single request: an FS_* mask in hex plus one absolute path. */
 +#define SMOLVM_FSNOTIFY_MAX (PATH_MAX + 32)
@@ -65,6 +70,8 @@ new file mode 100644
 +{
 +	char *kbuf, *pathstr;
 +	struct path path;
++	struct dentry *parent = NULL;
++	struct name_snapshot name;
 +	u32 mask;
 +	int ret;
 +
@@ -102,7 +109,29 @@ new file mode 100644
 +	if (ret)
 +		goto out;
 +
-+	fsnotify_dentry(path.dentry, mask);
++	/*
++	 * The host may have replaced this name with a different inode. The
++	 * virtiofs entry timeout would otherwise leave subsequent guest opens on
++	 * the old dentry after delivering the event. Expire the cached FUSE name
++	 * before waking watchers so their rescan resolves the current host inode.
++	 */
++	if (!IS_ROOT(path.dentry)) {
++		parent = dget_parent(path.dentry);
++		take_dentry_name_snapshot(&name, path.dentry);
++	}
++#if IS_ENABLED(CONFIG_FUSE_FS)
++	if (path.dentry->d_sb->s_magic == FUSE_SUPER_MAGIC)
++		fuse_invalidate_entry_cache(path.dentry);
++#endif
++	if (d_really_is_positive(path.dentry))
++		fsnotify_inode(d_inode(path.dentry), mask);
++	if (parent) {
++		fsnotify_name(mask, path.dentry, FSNOTIFY_EVENT_DENTRY,
++			      d_inode(parent), &name.name, 0);
++		fsnotify_inode(d_inode(parent), FS_MODIFY);
++		release_dentry_name_snapshot(&name);
++		dput(parent);
++	}
 +	path_put(&path);
 +
 +	ret = count;
