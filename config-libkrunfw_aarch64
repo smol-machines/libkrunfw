@@ -536,7 +536,18 @@ CONFIG_ARCH_SUSPEND_POSSIBLE=y
 # end of CPU Frequency scaling
 # end of CPU Power Management
 
-# CONFIG_VIRTUALIZATION is not set
+#
+# Guest KVM: lets a machine run its own hypervisor (nested virtualization).
+# The host side already worked -- libkrun exposes the host's virtualization
+# extensions -- but with VIRTUALIZATION off the guest kernel had no KVM at all,
+# so /dev/kvm never appeared and anything needing a hypervisor failed inside the
+# guest with a misleading "KVM kernel module not loaded". x86_64 has carried
+# CONFIG_KVM=y for exactly this reason; this brings aarch64 in line. ARM64 has
+# no per-vendor KVM module, so there is no KVM_INTEL/KVM_AMD equivalent, and
+# olddefconfig pulls in the KVM_* helpers (verified against linux-6.12.95).
+#
+CONFIG_VIRTUALIZATION=y
+CONFIG_KVM=y
 CONFIG_CPU_MITIGATIONS=y
 
 #
