@@ -21,3 +21,6 @@ jobs:
 
       - name: Build x86_64 kernel
         run: make
+
+      - name: Verify resolved live resize configuration
+        run: sh scripts/check-live-resize-config.sh linux-*/.config
