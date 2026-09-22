@@ -64,6 +64,10 @@ for cfg in $CONFIGS; do
 	IFS=$OLDIFS
 done
 
+if ! sh scripts/check-live-resize-config.sh config-libkrunfw_x86_64; then
+	fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
 	echo "Required guest kernel config symbols are missing (see above)." >&2
 	exit 1
