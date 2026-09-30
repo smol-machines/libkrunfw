@@ -32,6 +32,7 @@ CONFIG_NETFILTER_XTABLES=y|xtables match/target infrastructure used by iptables-
 CONFIG_IP_NF_IPTABLES=y|iptables IPv4 tables
 CONFIG_IP6_NF_IPTABLES=y|iptables IPv6 tables
 CONFIG_NF_CONNTRACK=y|connection tracking; NAT and stateful matches depend on it
+CONFIG_NF_CONNTRACK_MARK=y|conntrack marks; nft "ct mark" rules (connmark-based routing) fail without it
 CONFIG_NF_NAT=y|NAT; translates service virtual IPs to endpoint addresses
 CONFIG_NFT_NUMGEN=y|numgen expression; kube-proxy spreads traffic across endpoints with it
 CONFIG_NFT_FIB_INET=y|fib expression; kube-proxy classifies local vs forwarded traffic with it
