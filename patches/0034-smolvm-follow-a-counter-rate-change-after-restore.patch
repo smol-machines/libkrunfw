@@ -1,0 +1,388 @@
+smolvm: keep time across a restore on a host with another counter rate
+
+A VM checkpointed on one host can be restored on another whose system
+counter runs at a different rate: 24 MHz on Apple silicon, 1 GHz on
+Armv8.6+ servers. The kernel fixes the counter rate at boot, so after such
+a move every clock would run fast or slow by the ratio of the two rates.
+
+Re-read CNTFRQ_EL0 in the virtual timer interrupt. When it no longer
+matches, keep time in boot-rate ticks by reading the virtual counter
+through a mapping, ticks = base + (hw - hw_base) * boot_rate / rate, that
+continues exactly from the previous reading. The switch happens with the
+timekeeper locked so every clock stays continuous and monotonic. Event
+deadlines and the delay loop convert boot-rate ticks back to hardware
+ticks, and each CPU recomputes its event stream divider. The vDSO cannot
+apply the mapping, so user space falls back to the clock_gettime()
+syscall after the first rate change.
+
+The mapping is the identity until the rate first changes, so a VM that
+never moves behaves exactly as before.
+---
+diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch_timer.c
+--- a/drivers/clocksource/arm_arch_timer.c
++++ b/drivers/clocksource/arm_arch_timer.c
+@@ -28,6 +28,9 @@
+ #include <linux/acpi.h>
+ #include <linux/arm-smccc.h>
+ #include <linux/ptp_kvm.h>
++#include <linux/math64.h>
++#include <linux/seqlock.h>
++#include <linux/timekeeping.h>
+ 
+ #include <asm/arch_timer.h>
+ #include <asm/virt.h>
+@@ -96,6 +99,108 @@
+ static cpumask_t evtstrm_available = CPU_MASK_NONE;
+ static bool evtstrm_enable __ro_after_init = IS_ENABLED(CONFIG_ARM_ARCH_TIMER_EVTSTREAM);
+ 
++/*
++ * A virtual machine can be checkpointed on one host and restored on another
++ * whose system counter runs at a different rate, e.g. 24 MHz on Apple silicon
++ * and 1 GHz on Armv8.6+ servers. Everything above this driver converts
++ * counter ticks to time with the rate it saw at boot, so after such a move
++ * the virtual counter is read through a mapping back into boot-rate ticks:
++ *
++ *	ticks = virt_base + (hw - hw_base) * mult >> ARCH_TIMER_REBASE_SHIFT
++ *
++ * The mapping is the identity until the counter rate first changes, which
++ * the timer interrupt notices by re-reading CNTFRQ_EL0. Event deadlines are
++ * converted the other way with inv_mult. The two copies are a seqcount
++ * latch so NMI-safe and noinstr readers never see a torn mapping.
++ */
++#define ARCH_TIMER_REBASE_SHIFT	48
++
++struct arch_timer_rebase_data {
++	u64	hw_base;
++	u64	virt_base;
++	u64	mult;		/* boot rate / current rate */
++	u64	inv_mult;	/* current rate / boot rate */
++};
++
++static struct {
++	seqcount_latch_t		seq;
++	struct arch_timer_rebase_data	data[2];
++} arch_timer_rebase ____cacheline_aligned = {
++	.seq = SEQCNT_LATCH_ZERO(arch_timer_rebase.seq),
++};
++
++/* Set once the counter has run at a rate other than the boot rate. */
++static bool arch_timer_rebased;
++/* Rate the counter runs at now; 0 when rate changes are not followed. */
++static u32 arch_timer_cur_rate;
++/* Rate each CPU's event stream divider was computed for. */
++static DEFINE_PER_CPU(u32, arch_timer_evtstrm_rate);
++static DEFINE_RAW_SPINLOCK(arch_timer_rebase_lock);
++
++/*
++ * Read-only marker: user space (the smolvm guest agent) checks for it before
++ * allowing a checkpoint of this guest to move to a host whose counter runs at
++ * another rate.
++ */
++static bool arch_timer_follows_counter_rate = true;
++module_param_named(follows_counter_rate, arch_timer_follows_counter_rate, bool, 0444);
++
++static __always_inline u64
++arch_timer_rebase_map(const struct arch_timer_rebase_data *rb, u64 hw)
++{
++	return rb->virt_base +
++	       mul_u64_u64_shr(hw - rb->hw_base, rb->mult, ARCH_TIMER_REBASE_SHIFT);
++}
++
++/*
++ * Read the counter with @read_hw and map it to boot-rate ticks. The hardware
++ * read happens inside the latch section, after the mapping was published, so
++ * it is never older than the mapping's hw_base.
++ */
++#define arch_timer_rebased_read(read_hw)				\
++({									\
++	u64 __ticks;							\
++									\
++	if (likely(!smp_load_acquire(&arch_timer_rebased))) {		\
++		__ticks = (read_hw);					\
++	} else {							\
++		unsigned int __seq;					\
++									\
++		do {							\
++			__seq = raw_read_seqcount_latch(&arch_timer_rebase.seq); \
++			__ticks = arch_timer_rebase_map(		\
++				&arch_timer_rebase.data[__seq & 1], (read_hw)); \
++		} while (raw_read_seqcount_latch_retry(&arch_timer_rebase.seq, __seq)); \
++	}								\
++	__ticks;							\
++})
++
++/**
++ * arch_timer_hw_cycles - convert boot-rate ticks to hardware counter ticks
++ * @ticks: an interval in ticks of the rate the kernel booted with
++ *
++ * For code that programs or polls the hardware counter directly, such as
++ * timer deadlines and the delay loop. The identity until the counter rate
++ * changes.
++ */
++u64 notrace arch_timer_hw_cycles(u64 ticks)
++{
++	unsigned int seq;
++	u64 hw;
++
++	if (likely(!smp_load_acquire(&arch_timer_rebased)))
++		return ticks;
++
++	do {
++		seq = raw_read_seqcount_latch(&arch_timer_rebase.seq);
++		hw = mul_u64_u64_shr(ticks, arch_timer_rebase.data[seq & 1].inv_mult,
++				     ARCH_TIMER_REBASE_SHIFT);
++	} while (raw_read_seqcount_latch_retry(&arch_timer_rebase.seq, seq));
++
++	return hw;
++}
++EXPORT_SYMBOL_GPL(arch_timer_hw_cycles);
++
+ static int __init early_evtstrm_cfg(char *buf)
+ {
+ 	return kstrtobool(buf, &evtstrm_enable);
+@@ -212,21 +317,21 @@
+ 
+ static noinstr u64 raw_counter_get_cntvct_stable(void)
+ {
+-	return __arch_counter_get_cntvct_stable();
++	return arch_timer_rebased_read(__arch_counter_get_cntvct_stable());
+ }
+ 
+ static notrace u64 arch_counter_get_cntvct_stable(void)
+ {
+ 	u64 val;
+ 	preempt_disable_notrace();
+-	val = __arch_counter_get_cntvct_stable();
++	val = arch_timer_rebased_read(__arch_counter_get_cntvct_stable());
+ 	preempt_enable_notrace();
+ 	return val;
+ }
+ 
+ static noinstr u64 arch_counter_get_cntvct(void)
+ {
+-	return __arch_counter_get_cntvct();
++	return arch_timer_rebased_read(__arch_counter_get_cntvct());
+ }
+ 
+ /*
+@@ -260,6 +365,52 @@
+ 	.read	= arch_counter_read_cc,
+ };
+ 
++/* Runs with the timekeeper locked; see timekeeping_rebase_clocksource(). */
++static void arch_timer_rebase_counter(void *arg)
++{
++	struct arch_timer_rebase_data rb;
++	u32 rate = *(u32 *)arg;
++	u64 hw = __arch_counter_get_cntvct();
++
++	/* Continue from where the current mapping is now. */
++	rb.hw_base = hw;
++	rb.virt_base = arch_timer_rebased ?
++		arch_timer_rebase_map(&arch_timer_rebase.data[0], hw) : hw;
++	rb.mult = mul_u64_u64_div_u64(arch_timer_rate,
++				      1ULL << ARCH_TIMER_REBASE_SHIFT, rate);
++	rb.inv_mult = mul_u64_u64_div_u64(rate, 1ULL << ARCH_TIMER_REBASE_SHIFT,
++					  arch_timer_rate);
++
++	arch_timer_rebase.data[1] = rb;
++	raw_write_seqcount_latch(&arch_timer_rebase.seq);
++	arch_timer_rebase.data[0] = rb;
++	raw_write_seqcount_latch(&arch_timer_rebase.seq);
++	smp_store_release(&arch_timer_rebased, true);
++	WRITE_ONCE(arch_timer_cur_rate, rate);
++
++	/*
++	 * The vDSO reads the hardware counter directly and cannot apply the
++	 * mapping, so user space falls back to the clock_gettime() syscall.
++	 */
++	clocksource_counter.vdso_clock_mode = VDSO_CLOCKMODE_NONE;
++}
++
++static noinline void arch_timer_rate_changed(u32 rate)
++{
++	bool changed = false;
++
++	raw_spin_lock(&arch_timer_rebase_lock);
++	if (rate != arch_timer_cur_rate) {
++		timekeeping_rebase_clocksource(arch_timer_rebase_counter, &rate);
++		changed = true;
++	}
++	raw_spin_unlock(&arch_timer_rebase_lock);
++
++	if (changed)
++		pr_info("counter now runs at %u Hz (booted at %u Hz), keeping time in boot-rate ticks\n",
++			rate, arch_timer_rate);
++}
++
+ struct ate_acpi_oem_info {
+ 	char oem_id[ACPI_OEM_ID_SIZE + 1];
+ 	char oem_table_id[ACPI_OEM_TABLE_ID_SIZE + 1];
+@@ -678,10 +829,36 @@
+ 	return IRQ_NONE;
+ }
+ 
++static void arch_timer_configure_evtstream(void);
++
++/*
++ * Notice that the counter now runs at another rate (the VM was restored on a
++ * different host) before anything converts counter ticks to time.
++ */
++static __always_inline void arch_timer_follow_rate(void)
++{
++	u32 cur = READ_ONCE(arch_timer_cur_rate);
++	u32 rate;
++
++	if (!cur)
++		return;
++
++	rate = arch_timer_get_cntfrq();
++	if (unlikely(rate && rate != cur)) {
++		arch_timer_rate_changed(rate);
++		cur = READ_ONCE(arch_timer_cur_rate);
++	}
++
++	if (unlikely(__this_cpu_read(arch_timer_evtstrm_rate) != cur) &&
++	    cpumask_test_cpu(smp_processor_id(), &evtstrm_available))
++		arch_timer_configure_evtstream();
++}
++
+ static irqreturn_t arch_timer_handler_virt(int irq, void *dev_id)
+ {
+ 	struct clock_event_device *evt = dev_id;
+ 
++	arch_timer_follow_rate();
+ 	return timer_handler(ARCH_TIMER_VIRT_ACCESS, evt);
+ }
+ 
+@@ -748,10 +925,12 @@
+ 	ctrl |= ARCH_TIMER_CTRL_ENABLE;
+ 	ctrl &= ~ARCH_TIMER_CTRL_IT_MASK;
+ 
+-	if (access == ARCH_TIMER_PHYS_ACCESS)
++	if (access == ARCH_TIMER_PHYS_ACCESS) {
+ 		cnt = __arch_counter_get_cntpct();
+-	else
++	} else {
+ 		cnt = __arch_counter_get_cntvct();
++		evt = arch_timer_hw_cycles(evt);
++	}
+ 
+ 	arch_timer_reg_write(access, ARCH_TIMER_REG_CVAL, evt + cnt, clk);
+ 	arch_timer_reg_write(access, ARCH_TIMER_REG_CTRL, ctrl, clk);
+@@ -936,13 +1115,16 @@
+ 
+ static void arch_timer_configure_evtstream(void)
+ {
++	u32 rate = READ_ONCE(arch_timer_cur_rate) ?: arch_timer_rate;
+ 	int evt_stream_div, lsb;
+ 
++	__this_cpu_write(arch_timer_evtstrm_rate, rate);
++
+ 	/*
+ 	 * As the event stream can at most be generated at half the frequency
+ 	 * of the counter, use half the frequency when computing the divider.
+ 	 */
+-	evt_stream_div = arch_timer_rate / ARCH_TIMER_EVT_STREAM_FREQ / 2;
++	evt_stream_div = rate / ARCH_TIMER_EVT_STREAM_FREQ / 2;
+ 
+ 	/*
+ 	 * Find the closest power of two to the divisor. If the adjacent bit
+@@ -1170,6 +1352,12 @@
+ 			 &cyclecounter, start_count);
+ 
+ 	sched_clock_register(scr, width, arch_timer_rate);
++
++	if ((type & ARCH_TIMER_TYPE_CP15) &&
++	    arch_timer_uses_ppi == ARCH_TIMER_VIRT_PPI &&
++	    !arch_timer_counter_has_wa() &&
++	    arch_timer_get_cntfrq() == arch_timer_rate)
++		WRITE_ONCE(arch_timer_cur_rate, arch_timer_rate);
+ }
+ 
+ static void arch_timer_stop(struct clock_event_device *clk)
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -1522,6 +1522,34 @@
+ }
+ 
+ /**
++ * timekeeping_rebase_clocksource - change how the current clocksource reads
++ * @rebase:	callback that switches the clocksource's read mapping
++ * @arg:	argument for @rebase
++ *
++ * For a clocksource whose underlying counter changed rate underneath the
++ * kernel, e.g. a virtual machine restored on a host with a different system
++ * counter frequency. @rebase runs with the timekeeper locked and must keep
++ * the clocksource's reads continuous: a read right after the switch may not
++ * be lower than a read right before it. Safe to call from hard interrupt
++ * context.
++ */
++void timekeeping_rebase_clocksource(void (*rebase)(void *), void *arg)
++{
++	struct timekeeper *tk = &tk_core.timekeeper;
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&timekeeper_lock, flags);
++	write_seqcount_begin(&tk_core.seq);
++
++	timekeeping_forward_now(tk);
++	rebase(arg);
++	timekeeping_update(tk, TK_MIRROR | TK_CLOCK_WAS_SET);
++
++	write_seqcount_end(&tk_core.seq);
++	raw_spin_unlock_irqrestore(&timekeeper_lock, flags);
++}
++
++/**
+  * timekeeping_notify - Install a new clock source
+  * @clock:		pointer to the clock source
+  *
+diff --git a/include/linux/timekeeping.h b/include/linux/timekeeping.h
+--- a/include/linux/timekeeping.h
++++ b/include/linux/timekeeping.h
+@@ -10,6 +10,7 @@
+ 
+ void timekeeping_init(void);
+ extern int timekeeping_suspended;
++extern void timekeeping_rebase_clocksource(void (*rebase)(void *), void *arg);
+ 
+ /* Architecture timer tick functions: */
+ extern void legacy_timer_tick(unsigned long ticks);
+diff --git a/include/clocksource/arm_arch_timer.h b/include/clocksource/arm_arch_timer.h
+--- a/include/clocksource/arm_arch_timer.h
++++ b/include/clocksource/arm_arch_timer.h
+@@ -89,6 +89,7 @@
+ extern u64 (*arch_timer_read_counter)(void);
+ extern struct arch_timer_kvm_info *arch_timer_get_kvm_info(void);
+ extern bool arch_timer_evtstrm_available(void);
++extern u64 arch_timer_hw_cycles(u64 ticks);
+ 
+ #else
+ 
+@@ -107,6 +108,11 @@
+ 	return false;
+ }
+ 
++static inline u64 arch_timer_hw_cycles(u64 ticks)
++{
++	return ticks;
++}
++
+ #endif
+ 
+ #endif
+diff --git a/arch/arm64/lib/delay.c b/arch/arm64/lib/delay.c
+--- a/arch/arm64/lib/delay.c
++++ b/arch/arm64/lib/delay.c
+@@ -42,6 +42,9 @@
+ {
+ 	cycles_t start = __delay_cycles();
+ 
++	/* @cycles are boot-rate ticks; the loops below poll the hardware counter. */
++	cycles = arch_timer_hw_cycles(cycles);
++
+ 	if (alternative_has_cap_unlikely(ARM64_HAS_WFXT)) {
+ 		u64 end = start + cycles;
+ 
