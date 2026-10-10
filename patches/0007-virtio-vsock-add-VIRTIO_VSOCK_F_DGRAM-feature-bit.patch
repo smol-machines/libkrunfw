@@ -8,11 +8,8 @@ This commit adds a feature bit for virtio vsock to support datagrams.
 Signed-off-by: Jiang Wang <jiang.wang@bytedance.com>
 Signed-off-by: Bobby Eshleman <bobby.eshleman@bytedance.com>
 ---
- include/uapi/linux/virtio_vsock.h | 1 +
- 1 file changed, 1 insertion(+)
-
 diff --git a/include/uapi/linux/virtio_vsock.h b/include/uapi/linux/virtio_vsock.h
-index 64738838bee5..9c25f267bbc0 100644
+index 64738838b..9c25f267b 100644
 --- a/include/uapi/linux/virtio_vsock.h
 +++ b/include/uapi/linux/virtio_vsock.h
 @@ -40,6 +40,7 @@
@@ -24,5 +21,4 @@ index 64738838bee5..9c25f267bbc0 100644
  struct virtio_vsock_config {
  	__le64 guest_cid;
 -- 
-2.54.0
-
+2.43.0

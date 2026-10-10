@@ -35,15 +35,9 @@ Examples:
 Signed-off-by: Hector Martin <marcan@marcan.st>
 Reviewed-by: Neal Gompa <neal@gompa.dev>
 ---
- include/linux/memory_ordering_model.h | 11 +++++++++++
- include/uapi/linux/prctl.h            |  5 +++++
- kernel/sys.c                          | 21 +++++++++++++++++++++
- 3 files changed, 37 insertions(+)
- create mode 100644 include/linux/memory_ordering_model.h
-
 diff --git a/include/linux/memory_ordering_model.h b/include/linux/memory_ordering_model.h
 new file mode 100644
-index 000000000000..267a12ca6630
+index 000000000..267a12ca6
 --- /dev/null
 +++ b/include/linux/memory_ordering_model.h
 @@ -0,0 +1,11 @@
@@ -59,12 +53,12 @@ index 000000000000..267a12ca6630
 +
 +#endif
 diff --git a/include/uapi/linux/prctl.h b/include/uapi/linux/prctl.h
-index 35791791a879..36c278683cd6 100644
+index 51c4e8c82..a8c81c4bd 100644
 --- a/include/uapi/linux/prctl.h
 +++ b/include/uapi/linux/prctl.h
-@@ -328,4 +328,9 @@ struct prctl_mm_map {
- # define PR_PPC_DEXCR_CTRL_CLEAR_ONEXEC	0x10 /* Clear the aspect on exec */
- # define PR_PPC_DEXCR_CTRL_MASK		0x1f
+@@ -386,4 +386,9 @@ struct prctl_mm_map {
+ # define PR_FUTEX_HASH_SET_SLOTS	1
+ # define PR_FUTEX_HASH_GET_SLOTS	2
  
 +#define PR_GET_MEM_MODEL	0x6d4d444c
 +#define PR_SET_MEM_MODEL	0x4d4d444c
@@ -73,7 +67,7 @@ index 35791791a879..36c278683cd6 100644
 +
  #endif /* _LINUX_PRCTL_H */
 diff --git a/kernel/sys.c b/kernel/sys.c
-index 8283e35c9eeb..b14846a80169 100644
+index c8376d7a0..26b3c25cc 100644
 --- a/kernel/sys.c
 +++ b/kernel/sys.c
 @@ -45,6 +45,7 @@
@@ -84,8 +78,8 @@ index 8283e35c9eeb..b14846a80169 100644
  
  #include <linux/compat.h>
  #include <linux/syscalls.h>
-@@ -2467,6 +2468,16 @@ static int prctl_get_auxv(void __user *addr, unsigned long len)
- 	return sizeof(mm->saved_auxv);
+@@ -2515,6 +2516,16 @@ static int prctl_set_thp_disable(bool thp_disable, unsigned long flags,
+ 	return 0;
  }
  
 +int __weak arch_prctl_mem_model_get(struct task_struct *t)
@@ -101,9 +95,9 @@ index 8283e35c9eeb..b14846a80169 100644
  SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
  		unsigned long, arg4, unsigned long, arg5)
  {
-@@ -2797,6 +2808,16 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
- 	case PR_RISCV_SET_ICACHE_FLUSH_CTX:
- 		error = RISCV_SET_ICACHE_FLUSH_CTX(arg2, arg3);
+@@ -2868,6 +2879,16 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+ 	case PR_FUTEX_HASH:
+ 		error = futex_hash_prctl(arg2, arg3, arg4);
  		break;
 +	case PR_GET_MEM_MODEL:
 +		if (arg2 || arg3 || arg4 || arg5)
@@ -116,8 +110,7 @@ index 8283e35c9eeb..b14846a80169 100644
 +		error = arch_prctl_mem_model_set(me, arg2);
 +		break;
  	default:
+ 		trace_task_prctl_unknown(option, arg2, arg3, arg4, arg5);
  		error = -EINVAL;
- 		break;
 -- 
-2.54.0
-
+2.43.0

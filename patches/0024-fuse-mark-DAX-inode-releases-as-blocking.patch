@@ -47,16 +47,13 @@ Signed-off-by: Sergio Lopez <slp@redhat.com>
 (cherry picked from commit 1e0dbed3e2ff0ab76fa4e3cc8f95438f56da8fc5)
 Signed-off-by: Sergio Lopez <slp@redhat.com>
 ---
- fs/fuse/file.c | 6 ++++++
- 1 file changed, 6 insertions(+)
-
 diff --git a/fs/fuse/file.c b/fs/fuse/file.c
-index 23afaadd5f3e..e59a08c71f12 100644
+index 0812eee88..a0c504953 100644
 --- a/fs/fuse/file.c
 +++ b/fs/fuse/file.c
 @@ -116,6 +116,12 @@ static void fuse_file_put(struct fuse_file *ff, bool sync)
  			fuse_simple_request(ff->fm, args);
- 			fuse_release_end(ff->fm, args, 0);
+ 			fuse_release_end(args, 0);
  		} else {
 +			/*
 +			 * DAX inodes may need to issue a number of synchronous
@@ -68,5 +65,4 @@ index 23afaadd5f3e..e59a08c71f12 100644
  			if (fuse_simple_background(ff->fm, args,
  						   GFP_KERNEL | __GFP_NOFAIL))
 -- 
-2.54.0
-
+2.43.0

@@ -10,12 +10,8 @@ operate in this context (usually by using bounce buffers).
 
 Signed-off-by: Sergio Lopez <slp@redhat.com>
 ---
- drivers/virtio/virtio.c      | 6 ------
- drivers/virtio/virtio_ring.c | 4 ++++
- 2 files changed, 4 insertions(+), 6 deletions(-)
-
 diff --git a/drivers/virtio/virtio.c b/drivers/virtio/virtio.c
-index b9095751e43b..9e6420d5bc66 100644
+index 4ced08886..68c1a4078 100644
 --- a/drivers/virtio/virtio.c
 +++ b/drivers/virtio/virtio.c
 @@ -213,12 +213,6 @@ static int virtio_features_ok(struct virtio_device *dev)
@@ -32,7 +28,7 @@ index b9095751e43b..9e6420d5bc66 100644
  
  	if (!virtio_has_feature(dev, VIRTIO_F_VERSION_1))
 diff --git a/drivers/virtio/virtio_ring.c b/drivers/virtio/virtio_ring.c
-index c0276979675d..1d5b988e4452 100644
+index ddab68959..7801b9f13 100644
 --- a/drivers/virtio/virtio_ring.c
 +++ b/drivers/virtio/virtio_ring.c
 @@ -6,6 +6,7 @@
@@ -43,7 +39,7 @@ index c0276979675d..1d5b988e4452 100644
  #include <linux/device.h>
  #include <linux/slab.h>
  #include <linux/module.h>
-@@ -282,6 +283,9 @@ static bool vring_use_dma_api(const struct virtio_device *vdev)
+@@ -272,6 +273,9 @@ static bool vring_use_map_api(const struct virtio_device *vdev)
  	if (!virtio_has_dma_quirk(vdev))
  		return true;
  
@@ -54,5 +50,4 @@ index c0276979675d..1d5b988e4452 100644
  	/*
  	 * In theory, it's possible to have a buggy QEMU-supposed
 -- 
-2.54.0
-
+2.43.0

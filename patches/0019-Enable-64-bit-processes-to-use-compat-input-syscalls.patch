@@ -12,18 +12,11 @@ tasks to opt-in for compat input syscalls.
 
 Signed-off-by: Sergio Lopez <slp@redhat.com>
 ---
- drivers/input/input-compat.c |  6 +++---
- drivers/input/input-compat.h |  2 +-
- include/linux/sched.h        |  5 +++++
- include/uapi/linux/prctl.h   |  5 +++++
- kernel/sys.c                 | 15 +++++++++++++++
- 5 files changed, 29 insertions(+), 4 deletions(-)
-
 diff --git a/drivers/input/input-compat.c b/drivers/input/input-compat.c
-index 2ccd3eedbd67..abb8cfb99d6c 100644
+index 8860a0730..8dfe1f456 100644
 --- a/drivers/input/input-compat.c
 +++ b/drivers/input/input-compat.c
-@@ -14,7 +14,7 @@
+@@ -15,7 +15,7 @@
  int input_event_from_user(const char __user *buffer,
  			  struct input_event *event)
  {
@@ -32,7 +25,7 @@ index 2ccd3eedbd67..abb8cfb99d6c 100644
  		struct input_event_compat compat_event;
  
  		if (copy_from_user(&compat_event, buffer,
-@@ -38,7 +38,7 @@ int input_event_from_user(const char __user *buffer,
+@@ -39,7 +39,7 @@ int input_event_from_user(const char __user *buffer,
  int input_event_to_user(char __user *buffer,
  			const struct input_event *event)
  {
@@ -41,7 +34,7 @@ index 2ccd3eedbd67..abb8cfb99d6c 100644
  		struct input_event_compat compat_event;
  
  		compat_event.sec = event->input_event_sec;
-@@ -62,7 +62,7 @@ int input_event_to_user(char __user *buffer,
+@@ -63,7 +63,7 @@ int input_event_to_user(char __user *buffer,
  int input_ff_effect_from_user(const char __user *buffer, size_t size,
  			      struct ff_effect *effect)
  {
@@ -51,7 +44,7 @@ index 2ccd3eedbd67..abb8cfb99d6c 100644
  
  		if (size != sizeof(struct ff_effect_compat))
 diff --git a/drivers/input/input-compat.h b/drivers/input/input-compat.h
-index 3b7bb12b023b..e78c0492ce0d 100644
+index 99c87ceb9..e0e078306 100644
 --- a/drivers/input/input-compat.h
 +++ b/drivers/input/input-compat.h
 @@ -53,7 +53,7 @@ struct ff_effect_compat {
@@ -64,12 +57,12 @@ index 3b7bb12b023b..e78c0492ce0d 100644
  }
  
 diff --git a/include/linux/sched.h b/include/linux/sched.h
-index 2e4c437c7c90..f5237065e9fa 100644
+index e20e0bd7e..19ddf5d4c 100644
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
-@@ -1606,6 +1606,11 @@ struct task_struct {
- #ifdef CONFIG_USER_EVENTS
- 	struct user_event_mm		*user_event_mm;
+@@ -1619,6 +1619,11 @@ struct task_struct {
+ #ifdef CONFIG_KSTACK_ERASE_METRICS
+ 	unsigned long			prev_lowest_stack;
  #endif
 +	/*
 +	 * Whether the task wants to use compat input syscalls even if it's
@@ -77,13 +70,13 @@ index 2e4c437c7c90..f5237065e9fa 100644
 +	 */
 +	bool compat_input;
  
- 	/*
- 	 * New fields for task_struct should be added above here, so that
+ #ifdef CONFIG_RANDOMIZE_KSTACK_OFFSET
+ 	u32				kstack_offset;
 diff --git a/include/uapi/linux/prctl.h b/include/uapi/linux/prctl.h
-index 36c278683cd6..c2027aa99409 100644
+index a8c81c4bd..54fd88dfe 100644
 --- a/include/uapi/linux/prctl.h
 +++ b/include/uapi/linux/prctl.h
-@@ -333,4 +333,9 @@ struct prctl_mm_map {
+@@ -391,4 +391,9 @@ struct prctl_mm_map {
  # define PR_SET_MEM_MODEL_DEFAULT	0
  # define PR_SET_MEM_MODEL_TSO		1
  
@@ -94,10 +87,10 @@ index 36c278683cd6..c2027aa99409 100644
 +
  #endif /* _LINUX_PRCTL_H */
 diff --git a/kernel/sys.c b/kernel/sys.c
-index b14846a80169..f98671f25026 100644
+index 26b3c25cc..5bbcf86ea 100644
 --- a/kernel/sys.c
 +++ b/kernel/sys.c
-@@ -2818,6 +2818,21 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+@@ -2889,6 +2889,21 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
  			return -EINVAL;
  		error = arch_prctl_mem_model_set(me, arg2);
  		break;
@@ -117,8 +110,7 @@ index b14846a80169..f98671f25026 100644
 +			return -EINVAL;
 +		break;
  	default:
+ 		trace_task_prctl_unknown(option, arg2, arg3, arg4, arg5);
  		error = -EINVAL;
- 		break;
 -- 
-2.54.0
-
+2.43.0

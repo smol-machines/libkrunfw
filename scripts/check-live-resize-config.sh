@@ -15,7 +15,9 @@ for symbol in $symbols; do
         failed=1
     fi
 done
-if ! grep -qxF '# CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE is not set' "$config"; then
+# Linux 6.15 replaced MEMORY_HOTPLUG_DEFAULT_ONLINE with the MHP_DEFAULT_ONLINE_TYPE choice.
+if ! grep -qxF '# CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE is not set' "$config" &&
+   ! grep -qxF 'CONFIG_MHP_DEFAULT_ONLINE_TYPE_OFFLINE=y' "$config"; then
     echo "$config: memory onlining must remain agent-controlled" >&2
     failed=1
 fi
