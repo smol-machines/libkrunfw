@@ -8,14 +8,11 @@ into the AP reset vector used by libkrun's qboot.
 
 Signed-off-by: Sergio Lopez <slp@redhat.com>
 ---
- arch/x86/coco/sev/core.c | 25 ++++++++++++++++++++++++-
- 1 file changed, 24 insertions(+), 1 deletion(-)
-
 diff --git a/arch/x86/coco/sev/core.c b/arch/x86/coco/sev/core.c
-index 2be730765f83..aff0f627c3bd 100644
+index fefd7031b..15892a452 100644
 --- a/arch/x86/coco/sev/core.c
 +++ b/arch/x86/coco/sev/core.c
-@@ -1273,6 +1273,29 @@ void __init snp_set_wakeup_secondary_cpu(void)
+@@ -894,6 +894,29 @@ void __init snp_set_wakeup_secondary_cpu(void)
  	apic_update_callback(wakeup_secondary_cpu, wakeup_cpu_via_vmgexit);
  }
  
@@ -45,7 +42,7 @@ index 2be730765f83..aff0f627c3bd 100644
  int __init sev_es_setup_ap_jump_table(struct real_mode_header *rmh)
  {
  	u16 startup_cs, startup_ip;
-@@ -1284,7 +1307,7 @@ int __init sev_es_setup_ap_jump_table(struct real_mode_header *rmh)
+@@ -905,7 +928,7 @@ int __init sev_es_setup_ap_jump_table(struct real_mode_header *rmh)
  
  	/* On UP guests there is no jump table so this is not a failure */
  	if (!jump_table_addr)
@@ -55,5 +52,4 @@ index 2be730765f83..aff0f627c3bd 100644
  	/* Check if AP Jump Table is page-aligned */
  	if (jump_table_addr & ~PAGE_MASK)
 -- 
-2.54.0
-
+2.43.0

@@ -11,23 +11,19 @@ Instead, use the corresponding MSRs to determine whether SEV/SNP is
 enabled and the location of the cbit.
 
 Signed-off-by: Sergio Lopez <slp@redhat.com>
----
- arch/x86/mm/mem_encrypt_identity.c | 26 +++-----------------------
- 1 file changed, 3 insertions(+), 23 deletions(-)
-
-diff --git a/arch/x86/mm/mem_encrypt_identity.c b/arch/x86/mm/mem_encrypt_identity.c
-index b922b9fea6b6..c0de732b0121 100644
---- a/arch/x86/mm/mem_encrypt_identity.c
-+++ b/arch/x86/mm/mem_encrypt_identity.c
-@@ -495,37 +495,17 @@ void __head sme_enable(struct boot_params *bp)
+diff --git a/arch/x86/boot/startup/sme.c b/arch/x86/boot/startup/sme.c
+index e7ea65f3f..2beb7d3c0 100644
+--- a/arch/x86/boot/startup/sme.c
++++ b/arch/x86/boot/startup/sme.c
+@@ -490,38 +490,24 @@ void __init sme_enable(struct boot_params *bp)
  	unsigned int eax, ebx, ecx, edx;
  	unsigned long feature_mask;
  	unsigned long me_mask;
 +	unsigned long cbit;
- 	bool snp;
+ 	bool snp_en;
  	u64 msr;
  
- 	snp = snp_init(bp);
+ 	snp_en = snp_init(bp);
  
 -	/* Check for the SME/SEV support leaf */
 -	eax = 0x80000000;
@@ -39,14 +35,18 @@ index b922b9fea6b6..c0de732b0121 100644
  #define AMD_SME_BIT	BIT(0)
  #define AMD_SEV_BIT	BIT(1)
  
--	/*
+ 	/*
 -	 * Check for the SME/SEV feature:
 -	 *   CPUID Fn8000_001F[EAX]
 -	 *   - Bit 0 - Secure Memory Encryption support
 -	 *   - Bit 1 - Secure Encrypted Virtualization support
 -	 *   CPUID Fn8000_001F[EBX]
 -	 *   - Bits 5:0 - Pagetable bit position used to indicate encryption
--	 */
++	 * Coming from qboot-krunfw we cannot return from #VC, so read the
++	 * C-bit position from the GHCB MSR instead of CPUID. Without CPUID we
++	 * cannot tell whether the SNP cache-coherency mitigation is needed, so
++	 * assume it is.
+ 	 */
 -	eax = 0x8000001f;
 -	ecx = 0;
 -	native_cpuid(&eax, &ebx, &ecx, &edx);
@@ -55,11 +55,12 @@ index b922b9fea6b6..c0de732b0121 100644
 -		return;
 -
 -	me_mask = 1UL << (ebx & 0x3f);
-+	cbit = __rdmsr(MSR_AMD64_SEV_ES_GHCB) >> 24;
+-	sev_snp_needs_sfw = !(ebx & BIT(31));
++	cbit = native_rdmsrq(MSR_AMD64_SEV_ES_GHCB) >> 24;
 +	me_mask = 1UL << (cbit & 0x3f);
++	sev_snp_needs_sfw = true;
  
  	/* Check the SEV MSR whether SEV or SME is enabled */
- 	RIP_REL_REF(sev_status) = msr = __rdmsr(MSR_AMD64_SEV);
+ 	sev_status = msr = native_rdmsrq(MSR_AMD64_SEV);
 -- 
-2.54.0
-
+2.43.0
