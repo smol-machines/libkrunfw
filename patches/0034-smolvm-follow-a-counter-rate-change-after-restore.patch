@@ -18,7 +18,22 @@ syscall after the first rate change.
 The mapping is the identity until the rate first changes, so a VM that
 never moves behaves exactly as before.
 ---
+diff --git a/arch/arm64/lib/delay.c b/arch/arm64/lib/delay.c
+index e278e060e..d5cc98223 100644
+--- a/arch/arm64/lib/delay.c
++++ b/arch/arm64/lib/delay.c
+@@ -42,6 +42,9 @@ void __delay(unsigned long cycles)
+ {
+ 	cycles_t start = __delay_cycles();
+ 
++	/* @cycles are boot-rate ticks; the loops below poll the hardware counter. */
++	cycles = arch_timer_hw_cycles(cycles);
++
+ 	if (alternative_has_cap_unlikely(ARM64_HAS_WFXT)) {
+ 		u64 end = start + cycles;
+ 
 diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch_timer.c
+index 90aeff44a..4d3458a76 100644
 --- a/drivers/clocksource/arm_arch_timer.c
 +++ b/drivers/clocksource/arm_arch_timer.c
 @@ -28,6 +28,9 @@
@@ -31,7 +46,7 @@ diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch
  
  #include <asm/arch_timer.h>
  #include <asm/virt.h>
-@@ -96,6 +99,108 @@
+@@ -65,6 +68,108 @@ static enum vdso_clock_mode vdso_default = VDSO_CLOCKMODE_NONE;
  static cpumask_t evtstrm_available = CPU_MASK_NONE;
  static bool evtstrm_enable __ro_after_init = IS_ENABLED(CONFIG_ARM_ARCH_TIMER_EVTSTREAM);
  
@@ -140,7 +155,7 @@ diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch
  static int __init early_evtstrm_cfg(char *buf)
  {
  	return kstrtobool(buf, &evtstrm_enable);
-@@ -212,21 +317,21 @@
+@@ -111,21 +216,21 @@ static noinstr u64 arch_counter_get_cntpct(void)
  
  static noinstr u64 raw_counter_get_cntvct_stable(void)
  {
@@ -165,7 +180,7 @@ diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch
  }
  
  /*
-@@ -260,6 +365,52 @@
+@@ -159,6 +264,52 @@ static struct cyclecounter cyclecounter __ro_after_init = {
  	.read	= arch_counter_read_cc,
  };
  
@@ -218,7 +233,7 @@ diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch
  struct ate_acpi_oem_info {
  	char oem_id[ACPI_OEM_ID_SIZE + 1];
  	char oem_table_id[ACPI_OEM_TABLE_ID_SIZE + 1];
-@@ -678,10 +829,36 @@
+@@ -577,10 +728,36 @@ static __always_inline irqreturn_t timer_handler(const int access,
  	return IRQ_NONE;
  }
  
@@ -255,7 +270,7 @@ diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch
  	return timer_handler(ARCH_TIMER_VIRT_ACCESS, evt);
  }
  
-@@ -748,10 +925,12 @@
+@@ -623,10 +800,12 @@ static __always_inline void set_next_event(const int access, unsigned long evt,
  	ctrl |= ARCH_TIMER_CTRL_ENABLE;
  	ctrl &= ~ARCH_TIMER_CTRL_IT_MASK;
  
@@ -268,9 +283,9 @@ diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch
 +		evt = arch_timer_hw_cycles(evt);
 +	}
  
- 	arch_timer_reg_write(access, ARCH_TIMER_REG_CVAL, evt + cnt, clk);
- 	arch_timer_reg_write(access, ARCH_TIMER_REG_CTRL, ctrl, clk);
-@@ -936,13 +1115,16 @@
+ 	arch_timer_reg_write_cp15(access, ARCH_TIMER_REG_CVAL, evt + cnt);
+ 	arch_timer_reg_write_cp15(access, ARCH_TIMER_REG_CTRL, ctrl);
+@@ -735,13 +914,16 @@ static void arch_timer_evtstrm_enable(unsigned int divider)
  
  static void arch_timer_configure_evtstream(void)
  {
@@ -288,26 +303,64 @@ diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch
  
  	/*
  	 * Find the closest power of two to the divisor. If the adjacent bit
-@@ -1170,6 +1352,12 @@
+@@ -947,6 +1129,12 @@ static void __init arch_counter_register(void)
  			 &cyclecounter, start_count);
  
  	sched_clock_register(scr, width, arch_timer_rate);
 +
-+	if ((type & ARCH_TIMER_TYPE_CP15) &&
-+	    arch_timer_uses_ppi == ARCH_TIMER_VIRT_PPI &&
++	/* 6.18 dropped the MMIO counter: this is always the CP15 counter. */
++	if (arch_timer_uses_ppi == ARCH_TIMER_VIRT_PPI &&
 +	    !arch_timer_counter_has_wa() &&
 +	    arch_timer_get_cntfrq() == arch_timer_rate)
 +		WRITE_ONCE(arch_timer_cur_rate, arch_timer_rate);
  }
  
  static void arch_timer_stop(struct clock_event_device *clk)
-diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
---- a/kernel/time/timekeeping.c
-+++ b/kernel/time/timekeeping.c
-@@ -1522,6 +1522,34 @@
+diff --git a/include/clocksource/arm_arch_timer.h b/include/clocksource/arm_arch_timer.h
+index 2eda895f1..89f29d0c2 100644
+--- a/include/clocksource/arm_arch_timer.h
++++ b/include/clocksource/arm_arch_timer.h
+@@ -90,6 +90,7 @@ extern u32 arch_timer_get_rate(void);
+ extern u64 (*arch_timer_read_counter)(void);
+ extern struct arch_timer_kvm_info *arch_timer_get_kvm_info(void);
+ extern bool arch_timer_evtstrm_available(void);
++extern u64 arch_timer_hw_cycles(u64 ticks);
+ 
+ #else
+ 
+@@ -108,6 +109,11 @@ static inline bool arch_timer_evtstrm_available(void)
+ 	return false;
  }
  
- /**
++static inline u64 arch_timer_hw_cycles(u64 ticks)
++{
++	return ticks;
++}
++
+ #endif
+ 
+ #endif
+diff --git a/include/linux/timekeeping.h b/include/linux/timekeeping.h
+index aee2c1a46..dded16a27 100644
+--- a/include/linux/timekeeping.h
++++ b/include/linux/timekeeping.h
+@@ -10,6 +10,7 @@
+ 
+ void timekeeping_init(void);
+ extern int timekeeping_suspended;
++extern void timekeeping_rebase_clocksource(void (*rebase)(void *), void *arg);
+ 
+ /* Architecture timer tick functions: */
+ extern void legacy_timer_tick(unsigned long ticks);
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+index 377e29ca5..3f9dfbe42 100644
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -1618,6 +1618,29 @@ static int change_clocksource(void *data)
+ 	return 0;
+ }
+ 
++/**
 + * timekeeping_rebase_clocksource - change how the current clocksource reads
 + * @rebase:	callback that switches the clocksource's read mapping
 + * @arg:	argument for @rebase
@@ -321,68 +374,17 @@ diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
 + */
 +void timekeeping_rebase_clocksource(void (*rebase)(void *), void *arg)
 +{
-+	struct timekeeper *tk = &tk_core.timekeeper;
-+	unsigned long flags;
++	scoped_guard (raw_spinlock_irqsave, &tk_core.lock) {
++		struct timekeeper *tks = &tk_core.shadow_timekeeper;
 +
-+	raw_spin_lock_irqsave(&timekeeper_lock, flags);
-+	write_seqcount_begin(&tk_core.seq);
-+
-+	timekeeping_forward_now(tk);
-+	rebase(arg);
-+	timekeeping_update(tk, TK_MIRROR | TK_CLOCK_WAS_SET);
-+
-+	write_seqcount_end(&tk_core.seq);
-+	raw_spin_unlock_irqrestore(&timekeeper_lock, flags);
++		timekeeping_forward_now(tks);
++		rebase(arg);
++		timekeeping_update_from_shadow(&tk_core, TK_CLOCK_WAS_SET);
++	}
 +}
 +
-+/**
+ /**
   * timekeeping_notify - Install a new clock source
   * @clock:		pointer to the clock source
-  *
-diff --git a/include/linux/timekeeping.h b/include/linux/timekeeping.h
---- a/include/linux/timekeeping.h
-+++ b/include/linux/timekeeping.h
-@@ -10,6 +10,7 @@
- 
- void timekeeping_init(void);
- extern int timekeeping_suspended;
-+extern void timekeeping_rebase_clocksource(void (*rebase)(void *), void *arg);
- 
- /* Architecture timer tick functions: */
- extern void legacy_timer_tick(unsigned long ticks);
-diff --git a/include/clocksource/arm_arch_timer.h b/include/clocksource/arm_arch_timer.h
---- a/include/clocksource/arm_arch_timer.h
-+++ b/include/clocksource/arm_arch_timer.h
-@@ -89,6 +89,7 @@
- extern u64 (*arch_timer_read_counter)(void);
- extern struct arch_timer_kvm_info *arch_timer_get_kvm_info(void);
- extern bool arch_timer_evtstrm_available(void);
-+extern u64 arch_timer_hw_cycles(u64 ticks);
- 
- #else
- 
-@@ -107,6 +108,11 @@
- 	return false;
- }
- 
-+static inline u64 arch_timer_hw_cycles(u64 ticks)
-+{
-+	return ticks;
-+}
-+
- #endif
- 
- #endif
-diff --git a/arch/arm64/lib/delay.c b/arch/arm64/lib/delay.c
---- a/arch/arm64/lib/delay.c
-+++ b/arch/arm64/lib/delay.c
-@@ -42,6 +42,9 @@
- {
- 	cycles_t start = __delay_cycles();
- 
-+	/* @cycles are boot-rate ticks; the loops below poll the hardware counter. */
-+	cycles = arch_timer_hw_cycles(cycles);
-+
- 	if (alternative_has_cap_unlikely(ARM64_HAS_WFXT)) {
- 		u64 end = start + cycles;
- 
+-- 
+2.43.0

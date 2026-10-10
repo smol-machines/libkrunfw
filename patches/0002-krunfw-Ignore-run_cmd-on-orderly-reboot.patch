@@ -8,14 +8,11 @@ We don't really support restarting the conventional way, so ignore
 
 Signed-off-by: Sergio Lopez <slp@redhat.com>
 ---
- kernel/reboot.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
 diff --git a/kernel/reboot.c b/kernel/reboot.c
-index f6947c5bd671..5925d8fcfbfa 100644
+index 823722234..bea75615b 100644
 --- a/kernel/reboot.c
 +++ b/kernel/reboot.c
-@@ -853,7 +853,11 @@ static int __orderly_reboot(void)
+@@ -866,7 +866,11 @@ static int __orderly_reboot(void)
  {
  	int ret;
  
@@ -28,5 +25,4 @@ index f6947c5bd671..5925d8fcfbfa 100644
  	if (ret) {
  		pr_warn("Failed to start orderly reboot: forcing the issue\n");
 -- 
-2.54.0
-
+2.43.0

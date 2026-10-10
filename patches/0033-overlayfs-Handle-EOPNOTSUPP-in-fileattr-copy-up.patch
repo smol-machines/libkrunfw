@@ -18,21 +18,18 @@ chokepoint (ovl_real_fileattr_get) so all callers benefit.
 Fixes: 72db82115d2b ("ovl: copy up sync/noatime fileattr flags")
 Signed-off-by: smolvm <smolvm@users.noreply.github.com>
 ---
- fs/overlayfs/inode.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
 diff --git a/fs/overlayfs/inode.c b/fs/overlayfs/inode.c
-index abc1234..def5678 100644
+index 1cc1b60fc..c3b04914b 100644
 --- a/fs/overlayfs/inode.c
 +++ b/fs/overlayfs/inode.c
-@@ -721,7 +721,7 @@ int ovl_real_fileattr_get(const struct path *realpath, struct fileattr *fa)
+@@ -721,7 +721,7 @@ int ovl_real_fileattr_get(const struct path *realpath, struct file_kattr *fa)
  		return err;
-
+ 
  	err = vfs_fileattr_get(realpath->dentry, fa);
 -	if (err == -ENOIOCTLCMD)
 +	if (err == -ENOIOCTLCMD || err == -EOPNOTSUPP)
  		err = -ENOTTY;
  	return err;
  }
---
-2.52.0
+-- 
+2.43.0

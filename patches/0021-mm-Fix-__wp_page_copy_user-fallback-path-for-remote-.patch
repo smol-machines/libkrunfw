@@ -54,14 +54,11 @@ when using gdb on a binary present on a DAX filesystem.
 
 Signed-off-by: Asahi Lina <lina@asahilina.net>
 ---
- mm/memory.c | 7 ++++++-
- 1 file changed, 6 insertions(+), 1 deletion(-)
-
 diff --git a/mm/memory.c b/mm/memory.c
-index 49ee03c4392e..45170cc2cd56 100644
+index 72793ec63..88c4e8ddd 100644
 --- a/mm/memory.c
 +++ b/mm/memory.c
-@@ -3081,13 +3081,18 @@ static inline int __wp_page_copy_user(struct page *dst, struct page *src,
+@@ -3422,13 +3422,18 @@ static inline int __wp_page_copy_user(struct page *dst, struct page *src,
  			update_mmu_cache_range(vmf, vma, addr, vmf->pte, 1);
  	}
  
@@ -82,5 +79,4 @@ index 49ee03c4392e..45170cc2cd56 100644
  			goto warn;
  
 -- 
-2.54.0
-
+2.43.0

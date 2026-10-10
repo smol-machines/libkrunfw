@@ -1,20 +1,8 @@
---- a/net/tsi/af_tsi.h
-+++ b/net/tsi/af_tsi.h
-@@ -92,6 +92,11 @@
- 	unsigned int status;
- 	u32 svm_port;
- 	u32 svm_peer_port;
-+	/* Serializes the accept request/response pair on csocket without
-+	 * holding the listener's sock lock across the blocking wait (holding
-+	 * it deadlocks concurrent shutdown()/close() on the listener).
-+	 */
-+	struct mutex accept_lock;
- 	struct sockaddr *bound_addr;
- 	struct sockaddr *sendto_addr;
- 	int bound_addr_len;
+diff --git a/net/tsi/af_tsi.c b/net/tsi/af_tsi.c
+index f374a9c99..508e73dcc 100644
 --- a/net/tsi/af_tsi.c
 +++ b/net/tsi/af_tsi.c
-@@ -498,15 +498,22 @@
+@@ -536,15 +536,22 @@ static int tsi_accept_vsock(struct tsi_sock *tsk, struct socket **newsock,
  	pr_debug("%s: sending accept request id=%u\n", __func__,
  		 ta_req.svm_port);
  
@@ -37,7 +25,7 @@
  	if (err < 0) {
  		pr_debug("%s: error receiving accept response\n", __func__);
  		return err;
-@@ -551,6 +558,11 @@
+@@ -589,6 +596,11 @@ static int tsi_accept(struct socket *sock, struct socket *newsock,
  	struct sock *sk;
  	int err;
  
@@ -49,7 +37,7 @@
  	lock_sock(listener);
  	tsk = tsi_sk(sock->sk);
  	isocket = tsk->isocket;
-@@ -570,9 +582,10 @@
+@@ -608,9 +620,10 @@ static int tsi_accept(struct socket *sock, struct socket *newsock,
  	} else {
  		panic("Unsupported family in tsk->family=%d", tsk->family);
  	}
@@ -61,7 +49,7 @@
  	}
  
  	sock_init_data(newsock, sk);
-@@ -580,6 +593,7 @@
+@@ -618,6 +631,7 @@ static int tsi_accept(struct socket *sock, struct socket *newsock,
  	set_bit(SOCK_CUSTOM_SOCKOPT, &sk->sk_socket->flags);
  
  	newtsk = tsi_sk(newsock->sk);
@@ -69,7 +57,7 @@
  	newtsk->family = tsk->family;
  
  	if (tsk->status == S_INET) {
-@@ -623,14 +637,11 @@
+@@ -661,14 +675,11 @@ static int tsi_accept(struct socket *sock, struct socket *newsock,
  	newtsk->csocket = csocket;
  	newsock->state = SS_CONNECTED;
  
@@ -84,7 +72,7 @@
  	return err;
  }
  
-@@ -1504,6 +1515,7 @@
+@@ -1567,6 +1578,7 @@ static int tsi_create_common(struct net *net, struct socket *sock, int protocol,
  	set_bit(SOCK_CUSTOM_SOCKOPT, &sk->sk_socket->flags);
  
  	tsk = tsi_sk(sk);
@@ -92,3 +80,19 @@
  
  	isocket = NULL;
  	err = __sock_create(current->nsproxy->net_ns, family, sock->type,
+diff --git a/net/tsi/af_tsi.h b/net/tsi/af_tsi.h
+index b74966fd7..d250a7804 100644
+--- a/net/tsi/af_tsi.h
++++ b/net/tsi/af_tsi.h
+@@ -92,6 +92,11 @@ struct tsi_sock {
+ 	unsigned int status;
+ 	u32 svm_port;
+ 	u32 svm_peer_port;
++	/* Serializes the accept request/response pair on csocket without
++	 * holding the listener's sock lock across the blocking wait (holding
++	 * it deadlocks concurrent shutdown()/close() on the listener).
++	 */
++	struct mutex accept_lock;
+ 	struct sockaddr *bound_addr;
+ 	struct sockaddr *sendto_addr;
+ 	int bound_addr_len;

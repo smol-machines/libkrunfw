@@ -1,8 +1,7 @@
-From 3e558b0b5aff5580bb9ed17828728c590d4d286f Mon Sep 17 00:00:00 2001
+From 2eae663e287e5be2188b83b8896a704e8d042afe Mon Sep 17 00:00:00 2001
 From: Hector Martin <marcan@marcan.st>
 Date: Thu, 11 Apr 2024 09:51:21 +0900
-Subject: [PATCH 15/30] arm64: Implement PR_{GET,SET}_MEM_MODEL for always-TSO
- CPUs
+Subject: [PATCH] arm64: Implement PR_{GET,SET}_MEM_MODEL for always-TSO CPUs
 
 Some ARM64 implementations are known to always use the TSO memory model.
 Add trivial support for the PR_{GET,SET}_MEM_MODEL prctl, which allows
@@ -16,21 +15,11 @@ Known TSO implementations:
 Signed-off-by: Hector Martin <marcan@marcan.st>
 Reviewed-by: Neal Gompa <neal@gompa.dev>
 ---
- arch/arm64/Kconfig                    |  9 +++++++
- arch/arm64/include/asm/cpufeature.h   |  4 +++
- arch/arm64/kernel/Makefile            |  3 ++-
- arch/arm64/kernel/cpufeature.c        | 11 ++++----
- arch/arm64/kernel/cpufeature_impdef.c | 38 +++++++++++++++++++++++++++
- arch/arm64/kernel/process.c           | 24 +++++++++++++++++
- arch/arm64/tools/cpucaps              |  1 +
- 7 files changed, 84 insertions(+), 6 deletions(-)
- create mode 100644 arch/arm64/kernel/cpufeature_impdef.c
-
 diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
-index f487c5e21e2f..8f97145095e0 100644
+index f7c4cb4fb..46282afbe 100644
 --- a/arch/arm64/Kconfig
 +++ b/arch/arm64/Kconfig
-@@ -2264,6 +2264,15 @@ config ARM64_DEBUG_PRIORITY_MASKING
+@@ -2320,6 +2320,15 @@ config ARM64_DEBUG_PRIORITY_MASKING
  	  If unsure, say N
  endif # ARM64_PSEUDO_NMI
  
@@ -47,10 +36,10 @@ index f487c5e21e2f..8f97145095e0 100644
  	bool "Build a relocatable kernel image" if EXPERT
  	select ARCH_HAS_RELR
 diff --git a/arch/arm64/include/asm/cpufeature.h b/arch/arm64/include/asm/cpufeature.h
-index 3d261cc123c1..c4379bde9a26 100644
+index e223cbf35..629d38196 100644
 --- a/arch/arm64/include/asm/cpufeature.h
 +++ b/arch/arm64/include/asm/cpufeature.h
-@@ -1038,6 +1038,10 @@ static inline bool cpu_has_lpa2(void)
+@@ -1078,6 +1078,10 @@ static inline bool cpu_has_lpa2(void)
  #endif
  }
  
@@ -62,24 +51,22 @@ index 3d261cc123c1..c4379bde9a26 100644
  
  #endif
 diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
-index 2b112f3b7510..2a11cdefbe04 100644
+index 76f32e424..70bf2f40a 100644
 --- a/arch/arm64/kernel/Makefile
 +++ b/arch/arm64/kernel/Makefile
-@@ -33,7 +33,8 @@ obj-y			:= debug-monitors.o entry.o irq.o fpsimd.o		\
- 			   return_address.o cpuinfo.o cpu_errata.o		\
+@@ -34,6 +34,7 @@ obj-y			:= debug-monitors.o entry.o irq.o fpsimd.o		\
  			   cpufeature.o alternative.o cacheinfo.o		\
  			   smp.o smp_spin_table.o topology.o smccc-call.o	\
--			   syscall.o proton-pack.o idle.o patching.o pi/
-+			   syscall.o proton-pack.o idle.o patching.o		\
-+			   cpufeature_impdef.o pi/
+ 			   syscall.o proton-pack.o idle.o patching.o pi/	\
++			   cpufeature_impdef.o					\
+ 			   rsi.o jump_label.o
  
  obj-$(CONFIG_COMPAT)			+= sys32.o signal32.o			\
- 					   sys_compat.o
 diff --git a/arch/arm64/kernel/cpufeature.c b/arch/arm64/kernel/cpufeature.c
-index b5bdb19c131f..4782d643ebed 100644
+index 39a798f74..090a9b8ad 100644
 --- a/arch/arm64/kernel/cpufeature.c
 +++ b/arch/arm64/kernel/cpufeature.c
-@@ -1039,7 +1039,7 @@ static void init_cpu_ftr_reg(u32 sys_reg, u64 new)
+@@ -1080,7 +1080,7 @@ static void init_cpu_ftr_reg(u32 sys_reg, u64 new)
  extern const struct arm64_cpu_capabilities arm64_errata[];
  static const struct arm64_cpu_capabilities arm64_features[];
  
@@ -88,7 +75,7 @@ index b5bdb19c131f..4782d643ebed 100644
  init_cpucap_indirect_list_from_array(const struct arm64_cpu_capabilities *caps)
  {
  	for (; caps->matches; caps++) {
-@@ -1538,8 +1538,8 @@ has_always(const struct arm64_cpu_capabilities *entry, int scope)
+@@ -1592,8 +1592,8 @@ has_always(const struct arm64_cpu_capabilities *entry, int scope)
  	return true;
  }
  
@@ -99,7 +86,7 @@ index b5bdb19c131f..4782d643ebed 100644
  {
  	int val, min, max;
  	u64 tmp;
-@@ -1592,14 +1592,14 @@ has_user_cpuid_feature(const struct arm64_cpu_capabilities *entry, int scope)
+@@ -1646,14 +1646,14 @@ has_user_cpuid_feature(const struct arm64_cpu_capabilities *entry, int scope)
  	if (!mask)
  		return false;
  
@@ -116,7 +103,7 @@ index b5bdb19c131f..4782d643ebed 100644
  }
  
  const struct cpumask *system_32bit_el0_cpumask(void)
-@@ -3566,6 +3566,7 @@ void __init setup_boot_cpu_features(void)
+@@ -3829,6 +3829,7 @@ void __init setup_boot_cpu_features(void)
  	 * handle the boot CPU.
  	 */
  	init_cpucap_indirect_list();
@@ -126,7 +113,7 @@ index b5bdb19c131f..4782d643ebed 100644
  	 * Detect broken pseudo-NMI. Must be called _before_ the call to
 diff --git a/arch/arm64/kernel/cpufeature_impdef.c b/arch/arm64/kernel/cpufeature_impdef.c
 new file mode 100644
-index 000000000000..de784a1fb49b
+index 000000000..82224d613
 --- /dev/null
 +++ b/arch/arm64/kernel/cpufeature_impdef.c
 @@ -0,0 +1,38 @@
@@ -148,7 +135,7 @@ index 000000000000..de784a1fb49b
 +		{ /* sentinel */ }
 +	};
 +
-+	return is_midr_in_range_list(read_cpuid_id(), fixed_tso_list);
++	return is_midr_in_range_list(fixed_tso_list);
 +}
 +#endif
 +
@@ -157,7 +144,7 @@ index 000000000000..de784a1fb49b
 +	{
 +		.desc = "TSO memory model (Fixed)",
 +		.capability = ARM64_HAS_TSO_FIXED,
-+		.type = SCOPE_LOCAL_CPU | ARM64_CPUCAP_PERMITTED_FOR_LATE_CPU,
++		.type = ARM64_CPUCAP_EARLY_LOCAL_CPU_FEATURE,
 +		.matches = has_tso_fixed,
 +	},
 +#endif
@@ -169,10 +156,10 @@ index 000000000000..de784a1fb49b
 +	init_cpucap_indirect_list_from_array(arm64_impdef_features);
 +}
 diff --git a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c
-index 2edf88c1c695..c753a0f6183b 100644
+index 4c328b7c7..bc643372f 100644
 --- a/arch/arm64/kernel/process.c
 +++ b/arch/arm64/kernel/process.c
-@@ -41,6 +41,7 @@
+@@ -42,6 +42,7 @@
  #include <linux/thread_info.h>
  #include <linux/prctl.h>
  #include <linux/stacktrace.h>
@@ -180,7 +167,7 @@ index 2edf88c1c695..c753a0f6183b 100644
  
  #include <asm/alternative.h>
  #include <asm/arch_timer.h>
-@@ -570,6 +571,25 @@ void update_sctlr_el1(u64 sctlr)
+@@ -735,6 +736,25 @@ void update_sctlr_el1(u64 sctlr)
  	isb();
  }
  
@@ -206,7 +193,7 @@ index 2edf88c1c695..c753a0f6183b 100644
  /*
   * Thread switching.
   */
-@@ -709,6 +729,10 @@ void arch_setup_new_exec(void)
+@@ -876,6 +896,10 @@ void arch_setup_new_exec(void)
  		arch_prctl_spec_ctrl_set(current, PR_SPEC_STORE_BYPASS,
  					 PR_SPEC_ENABLE);
  	}
@@ -218,10 +205,10 @@ index 2edf88c1c695..c753a0f6183b 100644
  
  #ifdef CONFIG_ARM64_TAGGED_ADDR_ABI
 diff --git a/arch/arm64/tools/cpucaps b/arch/arm64/tools/cpucaps
-index eedb5acc21ed..bca63481e0cf 100644
+index 16d123088..c3f3a0c6f 100644
 --- a/arch/arm64/tools/cpucaps
 +++ b/arch/arm64/tools/cpucaps
-@@ -53,6 +53,7 @@ HAS_STAGE2_FWB
+@@ -61,6 +61,7 @@ HAS_STAGE2_FWB
  HAS_TCR2
  HAS_TIDCP1
  HAS_TLB_RANGE
@@ -230,5 +217,4 @@ index eedb5acc21ed..bca63481e0cf 100644
  HAS_VIRT_HOST_EXTN
  HAS_WFXT
 -- 
-2.54.0
-
+2.43.0

@@ -25,24 +25,8 @@ Co-authored-by: Matej Hrica <mhrica@redhat.com>
 Signed-off-by: Sergio Lopez <slp@redhat.com>
 Signed-off-by: Matej Hrica <mhrica@redhat.com>
 ---
- include/linux/socket.h              |    8 +-
- net/Kconfig                         |    1 +
- net/Makefile                        |    1 +
- net/socket.c                        |    3 +
- net/tsi/Kconfig                     |    7 +
- net/tsi/Makefile                    |    4 +
- net/tsi/af_tsi.c                    | 1656 +++++++++++++++++++++++++++
- net/tsi/af_tsi.h                    |  107 ++
- security/selinux/hooks.c            |    8 +-
- security/selinux/include/classmap.h |    3 +-
- 10 files changed, 1795 insertions(+), 3 deletions(-)
- create mode 100644 net/tsi/Kconfig
- create mode 100644 net/tsi/Makefile
- create mode 100644 net/tsi/af_tsi.c
- create mode 100644 net/tsi/af_tsi.h
-
 diff --git a/include/linux/socket.h b/include/linux/socket.h
-index c3322eb3d686..5ae7f94b3abc 100644
+index 3b262487e..33d65c9a0 100644
 --- a/include/linux/socket.h
 +++ b/include/linux/socket.h
 @@ -240,8 +240,11 @@ struct ucred {
@@ -69,10 +53,10 @@ index c3322eb3d686..5ae7f94b3abc 100644
  
  /* Maximum queue length specifiable by listen.  */
 diff --git a/net/Kconfig b/net/Kconfig
-index a629f92dc86b..91dfb9152b5b 100644
+index 1d3f757d4..2cd972417 100644
 --- a/net/Kconfig
 +++ b/net/Kconfig
-@@ -274,6 +274,7 @@ source "net/switchdev/Kconfig"
+@@ -282,6 +282,7 @@ source "net/switchdev/Kconfig"
  source "net/l3mdev/Kconfig"
  source "net/qrtr/Kconfig"
  source "net/ncsi/Kconfig"
@@ -81,19 +65,19 @@ index a629f92dc86b..91dfb9152b5b 100644
  config PCPU_DEV_REFCNT
  	bool "Use percpu variables to maintain network device refcount"
 diff --git a/net/Makefile b/net/Makefile
-index 65bb8c72a35e..c1db937f3212 100644
+index 90e3d72bf..0ca0d7393 100644
 --- a/net/Makefile
 +++ b/net/Makefile
-@@ -79,3 +79,4 @@ obj-$(CONFIG_XDP_SOCKETS)	+= xdp/
- obj-$(CONFIG_MPTCP)		+= mptcp/
+@@ -80,3 +80,4 @@ obj-$(CONFIG_MPTCP)		+= mptcp/
  obj-$(CONFIG_MCTP)		+= mctp/
  obj-$(CONFIG_NET_HANDSHAKE)	+= handshake/
+ obj-$(CONFIG_NET_SHAPER)	+= shaper/
 +obj-$(CONFIG_TSI)		+= tsi/
 diff --git a/net/socket.c b/net/socket.c
-index 878155076bc0..a55927134851 100644
+index 4ce6ddd76..1ceffa67b 100644
 --- a/net/socket.c
 +++ b/net/socket.c
-@@ -217,6 +217,9 @@ static const char * const pf_family_names[] = {
+@@ -219,6 +219,9 @@ static const char * const pf_family_names[] = {
  	[PF_SMC]	= "PF_SMC",
  	[PF_XDP]	= "PF_XDP",
  	[PF_MCTP]	= "PF_MCTP",
@@ -105,7 +89,7 @@ index 878155076bc0..a55927134851 100644
  /*
 diff --git a/net/tsi/Kconfig b/net/tsi/Kconfig
 new file mode 100644
-index 000000000000..0f52ac6c9fa1
+index 000000000..0f52ac6c9
 --- /dev/null
 +++ b/net/tsi/Kconfig
 @@ -0,0 +1,7 @@
@@ -118,7 +102,7 @@ index 000000000000..0f52ac6c9fa1
 +	  TSI (Transparent Socket Impersonation).
 diff --git a/net/tsi/Makefile b/net/tsi/Makefile
 new file mode 100644
-index 000000000000..8b3cf74116a5
+index 000000000..8b3cf7411
 --- /dev/null
 +++ b/net/tsi/Makefile
 @@ -0,0 +1,4 @@
@@ -128,7 +112,7 @@ index 000000000000..8b3cf74116a5
 +tsi-y := af_tsi.o
 diff --git a/net/tsi/af_tsi.c b/net/tsi/af_tsi.c
 new file mode 100644
-index 000000000000..3d2bcd8d2ba4
+index 000000000..608a68265
 --- /dev/null
 +++ b/net/tsi/af_tsi.c
 @@ -0,0 +1,1725 @@
@@ -1859,7 +1843,7 @@ index 000000000000..3d2bcd8d2ba4
 +MODULE_LICENSE("GPL v2");
 diff --git a/net/tsi/af_tsi.h b/net/tsi/af_tsi.h
 new file mode 100644
-index 000000000000..b74966fd7ae3
+index 000000000..b74966fd7
 --- /dev/null
 +++ b/net/tsi/af_tsi.h
 @@ -0,0 +1,107 @@
@@ -1971,10 +1955,10 @@ index 000000000000..b74966fd7ae3
 +
 +#endif
 diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
-index 8e31d3b60fc6..aae3267fa9ee 100644
+index eef75bde6..29a7824e8 100644
 --- a/security/selinux/hooks.c
 +++ b/security/selinux/hooks.c
-@@ -1302,7 +1302,13 @@ static inline u16 socket_type_to_security_class(int family, int type, int protoc
+@@ -1311,7 +1311,13 @@ static inline u16 socket_type_to_security_class(int family, int type, int protoc
  			return SECCLASS_XDP_SOCKET;
  		case PF_MCTP:
  			return SECCLASS_MCTP_SOCKET;
@@ -1990,10 +1974,10 @@ index 8e31d3b60fc6..aae3267fa9ee 100644
  #endif
  		}
 diff --git a/security/selinux/include/classmap.h b/security/selinux/include/classmap.h
-index 7229c9bf6c27..f08d24321603 100644
+index 5665aa5e7..7aa998df6 100644
 --- a/security/selinux/include/classmap.h
 +++ b/security/selinux/include/classmap.h
-@@ -173,6 +173,7 @@ const struct security_class_mapping secclass_map[] = {
+@@ -174,6 +174,7 @@ const struct security_class_mapping secclass_map[] = {
  	    NULL } },
  	{ "xdp_socket", { COMMON_SOCK_PERMS, NULL } },
  	{ "mctp_socket", { COMMON_SOCK_PERMS, NULL } },
@@ -2001,14 +1985,14 @@ index 7229c9bf6c27..f08d24321603 100644
  	{ "perf_event",
  	  { "open", "cpu", "kernel", "tracepoint", "read", "write", NULL } },
  	{ "anon_inode", { COMMON_FILE_PERMS, NULL } },
-@@ -181,6 +182,6 @@ const struct security_class_mapping secclass_map[] = {
- 	{ NULL }
- };
+@@ -185,7 +186,7 @@ const struct security_class_mapping secclass_map[] = {
+ #ifdef __KERNEL__ /* avoid this check when building host programs */
+ #include <linux/socket.h>
  
 -#if PF_MAX > 46
 +#if PF_MAX > 49
  #error New address family defined, please update secclass_map.
  #endif
+ #endif
 -- 
-2.54.0
-
+2.43.0

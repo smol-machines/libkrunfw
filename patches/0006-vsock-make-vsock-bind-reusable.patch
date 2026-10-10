@@ -8,11 +8,8 @@ for different bind tables. For use by datagrams in a future patch.
 
 Signed-off-by: Bobby Eshleman <bobby.eshleman@bytedance.com>
 ---
- net/vmw_vsock/af_vsock.c | 33 ++++++++++++++++++++++++++-------
- 1 file changed, 26 insertions(+), 7 deletions(-)
-
 diff --git a/net/vmw_vsock/af_vsock.c b/net/vmw_vsock/af_vsock.c
-index 9046ea82a37b..6d3e95d94f76 100644
+index d2ff2df9a..f17190421 100644
 --- a/net/vmw_vsock/af_vsock.c
 +++ b/net/vmw_vsock/af_vsock.c
 @@ -235,11 +235,12 @@ static void __vsock_remove_connected(struct vsock_sock *vsk)
@@ -102,5 +99,4 @@ index 9046ea82a37b..6d3e95d94f76 100644
  			      struct sockaddr_vm *addr)
  {
 -- 
-2.54.0
-
+2.43.0

@@ -18,14 +18,11 @@ backed by tmpfs (which sets blksz == PAGE_SIZE on the host).
 
 Signed-off-by: Asahi Lina <lina@asahilina.net>
 ---
- fs/dax.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
 diff --git a/fs/dax.c b/fs/dax.c
-index 756400f2a625..cb155ec940d5 100644
+index 69ac2562c..9f1138c85 100644
 --- a/fs/dax.c
 +++ b/fs/dax.c
-@@ -1032,7 +1032,7 @@ int dax_writeback_mapping_range(struct address_space *mapping,
+@@ -1209,7 +1209,7 @@ int dax_writeback_mapping_range(struct address_space *mapping,
  	int ret = 0;
  	unsigned int scanned = 0;
  
@@ -35,5 +32,4 @@ index 756400f2a625..cb155ec940d5 100644
  
  	if (mapping_empty(mapping) || wbc->sync_mode != WB_SYNC_ALL)
 -- 
-2.54.0
-
+2.43.0

@@ -10,11 +10,8 @@ No functional change intended.
 
 Signed-off-by: Bobby Eshleman <bobby.eshleman@bytedance.com>
 ---
- net/vmw_vsock/af_vsock.c | 25 ++++++++++++++++++-------
- 1 file changed, 18 insertions(+), 7 deletions(-)
-
 diff --git a/net/vmw_vsock/af_vsock.c b/net/vmw_vsock/af_vsock.c
-index 460c9893e112..8049e3b4f377 100644
+index 642476ff0..a7165989e 100644
 --- a/net/vmw_vsock/af_vsock.c
 +++ b/net/vmw_vsock/af_vsock.c
 @@ -432,6 +432,22 @@ static void vsock_deassign_transport(struct vsock_sock *vsk)
@@ -57,5 +54,4 @@ index 460c9893e112..8049e3b4f377 100644
  	default:
  		ret = -ESOCKTNOSUPPORT;
 -- 
-2.54.0
-
+2.43.0

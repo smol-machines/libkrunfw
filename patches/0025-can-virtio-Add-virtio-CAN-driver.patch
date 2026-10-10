@@ -26,20 +26,11 @@ Reviewed-by: Francesco Valla <francesco@valla.it>
 Tested-by: Francesco Valla <francesco@valla.it>
 Signed-off-by: Matias Ezequiel Vara Larsen <mvaralar@redhat.com>
 ---
- MAINTAINERS                     |   9 +
- drivers/net/can/Kconfig         |  12 +
- drivers/net/can/Makefile        |   1 +
- drivers/net/can/virtio_can.c    | 991 ++++++++++++++++++++++++++++++++
- include/uapi/linux/virtio_can.h |  78 +++
- 5 files changed, 1091 insertions(+)
- create mode 100644 drivers/net/can/virtio_can.c
- create mode 100644 include/uapi/linux/virtio_can.h
-
 diff --git a/MAINTAINERS b/MAINTAINERS
-index d765c62c80ea..9ecb818f7ddb 100644
+index f5ea85882..558e9b0ce 100644
 --- a/MAINTAINERS
 +++ b/MAINTAINERS
-@@ -24464,6 +24464,15 @@ F:	drivers/scsi/virtio_scsi.c
+@@ -27138,6 +27138,15 @@ F:	drivers/scsi/virtio_scsi.c
  F:	include/uapi/linux/virtio_blk.h
  F:	include/uapi/linux/virtio_scsi.h
  
@@ -56,10 +47,10 @@ index d765c62c80ea..9ecb818f7ddb 100644
  M:	Amit Shah <amit@kernel.org>
  L:	virtualization@lists.linux.dev
 diff --git a/drivers/net/can/Kconfig b/drivers/net/can/Kconfig
-index cf989bea9aa3..851749f76d7c 100644
+index d43d56694..f33ae46d9 100644
 --- a/drivers/net/can/Kconfig
 +++ b/drivers/net/can/Kconfig
-@@ -208,6 +208,18 @@ config CAN_TI_HECC
+@@ -209,6 +209,18 @@ config CAN_TI_HECC
  	  Driver for TI HECC (High End CAN Controller) module found on many
  	  TI devices. The device specifications are available from www.ti.com
  
@@ -79,7 +70,7 @@ index cf989bea9aa3..851749f76d7c 100644
  	tristate "Xilinx CAN"
  	depends on ARCH_ZYNQ || ARM64 || MICROBLAZE || COMPILE_TEST
 diff --git a/drivers/net/can/Makefile b/drivers/net/can/Makefile
-index a71db2cfe990..ddfe0df9b10b 100644
+index 56138d8dd..2ddea733e 100644
 --- a/drivers/net/can/Makefile
 +++ b/drivers/net/can/Makefile
 @@ -32,6 +32,7 @@ obj-$(CONFIG_CAN_PEAK_PCIEFD)	+= peak_canfd/
@@ -92,7 +83,7 @@ index a71db2cfe990..ddfe0df9b10b 100644
  subdir-ccflags-$(CONFIG_CAN_DEBUG_DEVICES) += -DDEBUG
 diff --git a/drivers/net/can/virtio_can.c b/drivers/net/can/virtio_can.c
 new file mode 100644
-index 000000000000..0344dd03bd82
+index 000000000..0f10405c3
 --- /dev/null
 +++ b/drivers/net/can/virtio_can.c
 @@ -0,0 +1,991 @@
@@ -940,7 +931,7 @@ index 000000000000..0344dd03bd82
 +	/* Set Virtio CAN supported operations */
 +	priv->can.ctrlmode_supported = CAN_CTRLMODE_BERR_REPORTING;
 +	if (virtio_has_feature(vdev, VIRTIO_CAN_F_CAN_FD)) {
-+		priv->can.data_bittiming.bitrate = CAN_BITRATE_UNKNOWN;
++		priv->can.fd.data_bittiming.bitrate = CAN_BITRATE_UNKNOWN;
 +		err = can_set_static_ctrlmode(dev, CAN_CTRLMODE_FD);
 +		if (err != 0)
 +			goto on_failure;
@@ -1089,7 +1080,7 @@ index 000000000000..0344dd03bd82
 +MODULE_DESCRIPTION("CAN bus driver for Virtio CAN controller");
 diff --git a/include/uapi/linux/virtio_can.h b/include/uapi/linux/virtio_can.h
 new file mode 100644
-index 000000000000..08d7e3e78776
+index 000000000..08d7e3e78
 --- /dev/null
 +++ b/include/uapi/linux/virtio_can.h
 @@ -0,0 +1,78 @@
@@ -1172,5 +1163,4 @@ index 000000000000..08d7e3e78776
 +
 +#endif /* #ifndef _LINUX_VIRTIO_VIRTIO_CAN_H */
 -- 
-2.54.0
-
+2.43.0

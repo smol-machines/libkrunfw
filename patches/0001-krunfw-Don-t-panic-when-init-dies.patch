@@ -11,24 +11,19 @@ play with the printk levels instead.
 
 Signed-off-by: Sergio Lopez <slp@redhat.com>
 ---
- kernel/exit.c   | 6 ++++++
- kernel/reboot.c | 2 ++
- 2 files changed, 8 insertions(+)
-
 diff --git a/kernel/exit.c b/kernel/exit.c
-index b91124b2d334..b78ea85c953a 100644
+index e38b2bb85..eea19980a 100644
 --- a/kernel/exit.c
 +++ b/kernel/exit.c
-@@ -69,6 +69,8 @@
- #include <linux/rethook.h>
+@@ -69,6 +69,7 @@
  #include <linux/sysfs.h>
  #include <linux/user_events.h>
+ #include <linux/unwind_deferred.h>
 +#include <linux/reboot.h>
-+
  #include <linux/uaccess.h>
+ #include <linux/pidfs.h>
  
- #include <uapi/linux/wait.h>
-@@ -906,8 +908,12 @@ void __noreturn do_exit(long code)
+@@ -938,8 +939,12 @@ void __noreturn do_exit(long code)
  		 * immediately to get a useable coredump.
  		 */
  		if (unlikely(is_global_init(tsk)))
@@ -42,10 +37,10 @@ index b91124b2d334..b78ea85c953a 100644
  #ifdef CONFIG_POSIX_TIMERS
  		hrtimer_cancel(&tsk->signal->real_timer);
 diff --git a/kernel/reboot.c b/kernel/reboot.c
-index d6ee090eda94..f6947c5bd671 100644
+index 61924a056..823722234 100644
 --- a/kernel/reboot.c
 +++ b/kernel/reboot.c
-@@ -278,10 +278,12 @@ void kernel_restart(char *cmd)
+@@ -291,10 +291,12 @@ void kernel_restart(char *cmd)
  	do_kernel_restart_prepare();
  	migrate_to_reboot_cpu();
  	syscore_shutdown();
@@ -59,5 +54,4 @@ index d6ee090eda94..f6947c5bd671 100644
  	machine_restart(cmd);
  }
 -- 
-2.54.0
-
+2.43.0

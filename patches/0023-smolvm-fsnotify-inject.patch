@@ -10,6 +10,7 @@ guest agent.
 Signed-off-by: smolvm <noreply@smolvm>
 ---
 diff --git a/fs/notify/Makefile b/fs/notify/Makefile
+index 63a4b8828..5f40866e7 100644
 --- a/fs/notify/Makefile
 +++ b/fs/notify/Makefile
 @@ -2,6 +2,7 @@
@@ -22,6 +23,7 @@ diff --git a/fs/notify/Makefile b/fs/notify/Makefile
  obj-y			+= fanotify/
 diff --git a/fs/notify/smolvm_inject.c b/fs/notify/smolvm_inject.c
 new file mode 100644
+index 000000000..f2aad9235
 --- /dev/null
 +++ b/fs/notify/smolvm_inject.c
 @@ -0,0 +1,127 @@
@@ -152,3 +154,5 @@ new file mode 100644
 +}
 +
 +late_initcall(smolvm_fsnotify_init);
+-- 
+2.43.0
