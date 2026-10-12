@@ -1,0 +1,50 @@
+fuse: do not invalidate a DAX inode's mappings on open
+
+A DAX inode has no page cache: its mapping holds DAX entries for pages of
+the shared window that processes map directly. Since fs DAX pages became
+refcounted folios, invalidate_inode_pages2() on such an inode deletes
+entries whose pages are still mapped, so the folio loses its owner while
+page tables still point at it. The next fault on it trips the warnings in
+dax_folio_put(), dax_insert_entry() and zap_huge_pmd(), and the folio's
+reference count no longer matches its mappings.
+
+fuse_open(), fuse_create_open() and an attribute change all did this for
+every open without FOPEN_KEEP_CACHE. The invalidation buys nothing for DAX:
+reads go straight to the host's pages, so there is no stale copy to drop.
+Skip it for DAX inodes.
+---
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -727,7 +727,8 @@
+ 	} else {
+ 		if (fm->fc->atomic_o_trunc && trunc)
+ 			truncate_pagecache(inode, 0);
+-		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
++		else if (!(ff->open_flags & FOPEN_KEEP_CACHE) &&
++			 !FUSE_IS_DAX(inode))
+ 			invalidate_inode_pages2(inode->i_mapping);
+ 	}
+ 	return err;
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -294,7 +294,8 @@
+ 	if (!err) {
+ 		if (is_truncate)
+ 			truncate_pagecache(inode, 0);
+-		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
++		else if (!(ff->open_flags & FOPEN_KEEP_CACHE) &&
++			 !FUSE_IS_DAX(inode))
+ 			invalidate_inode_pages2(inode->i_mapping);
+ 	}
+ out_unlock:
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -395,7 +395,7 @@
+ 				inval = true;
+ 		}
+ 
+-		if (inval)
++		if (inval && !FUSE_IS_DAX(inode))
+ 			invalidate_inode_pages2(inode->i_mapping);
+ 	}
+ 
