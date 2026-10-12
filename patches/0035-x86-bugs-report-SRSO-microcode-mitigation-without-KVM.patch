@@ -1,0 +1,56 @@
+From 352e37a7f3d64ad5b15a8f1f75c9fdf38f42fb82 Mon Sep 17 00:00:00 2001
+From: binsquare <hebinsquared@gmail.com>
+Date: Sun, 11 Oct 2026 22:24:35 -0700
+Subject: [PATCH] x86/bugs: report SRSO microcode mitigation without KVM as
+ mitigated
+
+---
+ arch/x86/kernel/cpu/bugs.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/bugs.c b/arch/x86/kernel/cpu/bugs.c
+index fbc465555..14f20d222 100644
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -3161,6 +3161,20 @@ static void __init srso_select_mitigation(void)
+ 	}
+ }
+ 
++/*
++ * With the CPU not affected across user/kernel and a kernel that cannot host
++ * guests, the microcode (IBPB) mitigation covers every vector left, so do not
++ * report it as "Vulnerable: Microcode, no safe RET".
++ */
++static const char *srso_state(void)
++{
++	if (srso_mitigation == SRSO_MITIGATION_MICROCODE &&
++	    boot_cpu_has(X86_FEATURE_SRSO_USER_KERNEL_NO) &&
++	    !IS_ENABLED(CONFIG_KVM))
++		return "Mitigation: Microcode";
++	return srso_strings[srso_mitigation];
++}
++
+ static void __init srso_update_mitigation(void)
+ {
+ 	if (!boot_cpu_has_bug(X86_BUG_SRSO))
+@@ -3171,7 +3185,7 @@ static void __init srso_update_mitigation(void)
+ 	    boot_cpu_has(X86_FEATURE_IBPB_BRTYPE))
+ 		srso_mitigation = SRSO_MITIGATION_IBPB;
+ 
+-	pr_info("%s\n", srso_strings[srso_mitigation]);
++	pr_info("%s\n", srso_state());
+ }
+ 
+ static void __init srso_apply_mitigation(void)
+@@ -3640,7 +3654,7 @@ static ssize_t retbleed_show_state(char *buf)
+ 
+ static ssize_t srso_show_state(char *buf)
+ {
+-	return sysfs_emit(buf, "%s\n", srso_strings[srso_mitigation]);
++	return sysfs_emit(buf, "%s\n", srso_state());
+ }
+ 
+ static ssize_t gds_show_state(char *buf)
+-- 
+2.55.0
+
