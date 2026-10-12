@@ -1,0 +1,64 @@
+fuse: unmap again while waiting to reclaim a DAX range
+
+Reclaiming a DAX range unmaps it and waits for each busy page to become
+idle. The wait drops mapping->invalidate_lock, and since fs DAX pages are
+refcounted a mapping holds a page reference. A fault during the wait maps
+the page again, so the wait lasts as long as that mapping does; for a page
+of a shared library that every process maps, that is forever. The free
+range worker then never returns a range, every reader that needs one
+sleeps on range_waitq, and the whole guest stalls once the window is
+full.
+
+Wait at most 10ms at a time, then unmap the range again and look for busy
+pages afresh.
+---
+--- a/fs/fuse/dax.c
++++ b/fs/fuse/dax.c
+@@ -658,19 +658,37 @@
+ 	.iomap_end = fuse_iomap_end,
+ };
+ 
+-static void fuse_wait_dax_page(struct inode *inode)
+-{
+-	filemap_invalidate_unlock(inode->i_mapping);
+-	schedule();
+-	filemap_invalidate_lock(inode->i_mapping);
+-}
+-
+-/* Should be called with mapping->invalidate_lock held exclusively. */
++/*
++ * Should be called with mapping->invalidate_lock held exclusively.
++ *
++ * The lock is dropped while waiting for a busy page, which lets a fault map
++ * the page again, and a mapped page holds a reference of its own. Waiting for
++ * that one page to become idle then lasts as long as the new mapping does,
++ * which for a page every process maps (a shared library) is forever, and
++ * reclaim stops freeing ranges. So wait briefly, then unmap the range again
++ * and look for busy pages afresh.
++ */
+ int fuse_dax_break_layouts(struct inode *inode, u64 dmap_start,
+ 				  u64 dmap_end)
+ {
+-	return dax_break_layout(inode, dmap_start, dmap_end,
+-				fuse_wait_dax_page);
++	struct address_space *mapping = inode->i_mapping;
++	struct page *page;
++
++	if (!dax_mapping(mapping))
++		return 0;
++
++	while ((page = dax_layout_busy_page_range(mapping, dmap_start,
++						  dmap_end))) {
++		filemap_invalidate_unlock(mapping);
++		wait_var_event_timeout(page, dax_page_is_idle(page),
++				       msecs_to_jiffies(10));
++		filemap_invalidate_lock(mapping);
++		if (signal_pending(current))
++			return -ERESTARTSYS;
++	}
++
++	dax_delete_mapping_range(mapping, dmap_start, dmap_end);
++	return 0;
+ }
+ 
+ ssize_t fuse_dax_read_iter(struct kiocb *iocb, struct iov_iter *to)
