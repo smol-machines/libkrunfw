@@ -1,0 +1,122 @@
+fuse: block DAX faults while dropping entries on a size change
+
+Since fs DAX pages became refcounted folios, removing the entry of a page
+that a process still maps or pins corrupts the folio: the warnings in
+dax_folio_put(), dax_insert_entry() and zap_huge_pmd() fire, the process's
+rss counters go wrong, and a later wait for the page to go idle never ends.
+
+The O_TRUNC open and the truncating setattr already take invalidate_lock
+and break the layouts before they truncate. Four other paths did not:
+
+- an atomic create that truncates an existing file,
+- a setattr whose reply shows the size changed, which also invalidated
+  the whole mapping afterwards,
+- an attribute refresh that sees the server changed the size,
+- copy_file_range, which dropped the destination's entries without even
+  unmapping them first.
+
+truncate_pagecache() unmaps before it deletes entries, but a fault can map
+a page again in between. Give the first three a DAX variant that blocks
+faults and waits for pinned pages from the PMD holding the new size on,
+and skip the setattr invalidation for DAX, which has no page cache.
+copy_file_range has nothing to drop for DAX: the destination's pages are
+the host's, so they already hold the copied data.
+---
+--- a/fs/fuse/dax.c
++++ b/fs/fuse/dax.c
+@@ -691,6 +691,24 @@
+ 	return 0;
+ }
+ 
++/*
++ * truncate_pagecache() for a DAX inode. Fs DAX pages are refcounted folios,
++ * so removing the entry of a page that a process still maps or pins corrupts
++ * the folio. Block faults so nothing maps a page again between the unmap and
++ * the removal of its entry, and wait for pinned pages first. Start at the PMD
++ * holding the new size: a huge entry there also covers pages below it.
++ */
++void fuse_dax_truncate_pagecache(struct inode *inode, loff_t newsize)
++{
++	struct address_space *mapping = inode->i_mapping;
++
++	filemap_invalidate_lock(mapping);
++	/* On a signal, faults stay blocked; only a pin can still race. */
++	fuse_dax_break_layouts(inode, round_down(newsize, PMD_SIZE), -1);
++	truncate_pagecache(inode, newsize);
++	filemap_invalidate_unlock(mapping);
++}
++
+ ssize_t fuse_dax_read_iter(struct kiocb *iocb, struct iov_iter *to)
+ {
+ 	struct inode *inode = file_inode(iocb->ki_filp);
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -725,7 +725,9 @@
+ 		fi = get_fuse_inode(inode);
+ 		fuse_sync_release(fi, ff, flags);
+ 	} else {
+-		if (fm->fc->atomic_o_trunc && trunc)
++		if (fm->fc->atomic_o_trunc && trunc && FUSE_IS_DAX(inode))
++			fuse_dax_truncate_pagecache(inode, 0);
++		else if (fm->fc->atomic_o_trunc && trunc)
+ 			truncate_pagecache(inode, 0);
+ 		else if (!(ff->open_flags & FOPEN_KEEP_CACHE) &&
+ 			 !FUSE_IS_DAX(inode))
+@@ -2096,8 +2098,14 @@
+ 	 */
+ 	if ((is_truncate || !is_wb) &&
+ 	    S_ISREG(inode->i_mode) && oldsize != outarg.attr.size) {
+-		truncate_pagecache(inode, outarg.attr.size);
+-		invalidate_inode_pages2(mapping);
++		/* A DAX truncate already broke the layouts and blocks faults. */
++		if (FUSE_IS_DAX(inode) && !fault_blocked)
++			fuse_dax_truncate_pagecache(inode, outarg.attr.size);
++		else
++			truncate_pagecache(inode, outarg.attr.size);
++		/* DAX has no page cache, and faults may be running again. */
++		if (!FUSE_IS_DAX(inode))
++			invalidate_inode_pages2(mapping);
+ 	}
+ 
+ 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -3092,9 +3092,11 @@
+ 		goto out;
+ 	}
+ 
+-	truncate_inode_pages_range(inode_out->i_mapping,
+-				   ALIGN_DOWN(pos_out, PAGE_SIZE),
+-				   ALIGN(pos_out + bytes_copied, PAGE_SIZE) - 1);
++	/* A DAX inode has no page cache: its pages are the host's. */
++	if (!FUSE_IS_DAX(inode_out))
++		truncate_inode_pages_range(inode_out->i_mapping,
++					   ALIGN_DOWN(pos_out, PAGE_SIZE),
++					   ALIGN(pos_out + bytes_copied, PAGE_SIZE) - 1);
+ 
+ 	file_update_time(file_out);
+ 	fuse_write_update_attr(inode_out, pos_out + bytes_copied, bytes_copied);
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -1446,6 +1446,7 @@
+ ssize_t fuse_dax_write_iter(struct kiocb *iocb, struct iov_iter *from);
+ int fuse_dax_mmap(struct file *file, struct vm_area_struct *vma);
+ int fuse_dax_break_layouts(struct inode *inode, u64 dmap_start, u64 dmap_end);
++void fuse_dax_truncate_pagecache(struct inode *inode, loff_t newsize);
+ int fuse_dax_conn_alloc(struct fuse_conn *fc, enum fuse_dax_mode mode,
+ 			struct dax_device *dax_dev);
+ void fuse_dax_conn_free(struct fuse_conn *fc);
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -378,7 +378,10 @@
+ 		bool inval = false;
+ 
+ 		if (oldsize != attr->size) {
+-			truncate_pagecache(inode, attr->size);
++			if (FUSE_IS_DAX(inode))
++				fuse_dax_truncate_pagecache(inode, attr->size);
++			else
++				truncate_pagecache(inode, attr->size);
+ 			if (!fc->explicit_inval_data)
+ 				inval = true;
+ 		} else if (fc->auto_inval_data) {
