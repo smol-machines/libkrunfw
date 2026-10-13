@@ -1,0 +1,13 @@
+# TSI UDP routing and listener ownership
+
+Decision: Sean requested correction of actual container UDP failures; Root authorized bounded source changes and tests, implemented by Dewey and independently reviewed by Root and Pasteur on 2026-09-19. Preserve the existing TSI external proxy policy while using the guest INET stack for local traffic.
+
+A writable poll must not select the proxy before a connected datagram has been sent. Hybrid datagram polling observes both transports and preserves INET priority when both are readable. A connected outer socket with an unconnected proxy supplies its recorded peer on subsequent sends; unconnected nameless sends still fail.
+
+Non-initial namespace IPv4 loopback uses INET even without a pre-NAT listener, allowing Docker embedded DNS DNAT and preserving local errors without host fallback. Listener lookup runs under RCU and returns only a boolean: the internal lookup grants no reference, so it must not be sock_put. Supply the actual bound sender tuple and a non-null IPv6 source. For ordinary IPv4 sockets bound to ANY, use the existing route helper's selected source, preserving socket interface, unicast interface, mark, UID, TOS and security policy. Release the route on success before lookup; route failures log a rate-limited warning with identifying values.
+
+Run locally: `python3 -B -Werror -m unittest discover -s tests/tsi_udp -p 'test_*.py'`. Tests reconstruct the owning source from the actual ordered repository patches, including plain unified upstream patches, and compile the extracted send, poll, receive and listener functions against bounded socket/route seams. No guest, credentials or network access is needed.
+
+Verification: the predecessor without the final wildcard route selection passed actual public/embedded Docker DNS, bound local UDP in both namespaces and the unchanged Docker setup/verification. The initial wildcard reply then failed after the server received and replied, matching the source regression. The complete correction compiles on Linux6.12.95 arm64; actual wildcard successor runtime testing is pending. Kernel configuration is unchanged and has no swap. No IPv6 wildcard, ancillary-message source override, all-platform firmware, heavy-workload or hot-fork qualification is claimed. Darwin packaging retains the existing alignment reduction warning and valid signatures; it is not warning-free.
+
+The harness uses -Wall -Wextra -Werror. The listener extraction additionally disables sign-compare for two unchanged upstream address-length guards; this is an explicit harness limitation, not a warning-clean claim. Four exact predecessor failures are required by the suite to retain the causal reproduction.
