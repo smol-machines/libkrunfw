@@ -715,7 +715,7 @@ CONFIG_COREDUMP=y
 #
 # Memory Management options
 #
-CONFIG_SWAP=y
+# CONFIG_SWAP is not set
 
 #
 # SLAB allocator options
@@ -1075,7 +1075,7 @@ CONFIG_ARCH_MIGHT_HAVE_PC_PARPORT=y
 # CONFIG_PARPORT is not set
 CONFIG_BLK_DEV=y
 # CONFIG_BLK_DEV_NULL_BLK is not set
-CONFIG_ZRAM=y
+# CONFIG_ZRAM is not set
 CONFIG_BLK_DEV_LOOP=y
 CONFIG_BLK_DEV_LOOP_MIN_COUNT=0
 # CONFIG_BLK_DEV_DRBD is not set
