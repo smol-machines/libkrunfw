@@ -36,7 +36,9 @@ CONFIG_NF_CONNTRACK_MARK=y|conntrack marks; nft "ct mark" rules (connmark-based 
 CONFIG_NF_NAT=y|NAT; translates service virtual IPs to endpoint addresses
 CONFIG_NFT_NUMGEN=y|numgen expression; kube-proxy spreads traffic across endpoints with it
 CONFIG_NFT_FIB_INET=y|fib expression; kube-proxy classifies local vs forwarded traffic with it
-CONFIG_VXLAN=y|VXLAN overlay; pod networking backends tunnel over it'
+CONFIG_VXLAN=y|VXLAN overlay; pod networking backends tunnel over it
+CONFIG_SWAP=y|swap; without it a guest cannot swapon a file or a zram device, so a memory-heavy job (a Dialyzer run, a big test suite) dies at its RAM size instead of slowing down
+CONFIG_ZRAM=y|compressed RAM block device; gives a guest swap without a disk, which matters because the overlay root cannot hold a swapfile'
 
 fail=0
 for cfg in $CONFIGS; do
