@@ -36,7 +36,12 @@ CONFIG_NF_CONNTRACK_MARK=y|conntrack marks; nft "ct mark" rules (connmark-based 
 CONFIG_NF_NAT=y|NAT; translates service virtual IPs to endpoint addresses
 CONFIG_NFT_NUMGEN=y|numgen expression; kube-proxy spreads traffic across endpoints with it
 CONFIG_NFT_FIB_INET=y|fib expression; kube-proxy classifies local vs forwarded traffic with it
-CONFIG_VXLAN=y|VXLAN overlay; pod networking backends tunnel over it'
+CONFIG_VXLAN=y|VXLAN overlay; pod networking backends tunnel over it
+CONFIG_ANDROID_BINDER_IPC=y|Binder IPC; the Android emulator and Android containers cannot start without it
+CONFIG_ANDROID_BINDERFS=y|binderfs; Android mounts its binder devices from it instead of static /dev nodes
+CONFIG_DMABUF_HEAPS=y|DMA-BUF heaps framework; gates the system heap below
+CONFIG_DMABUF_HEAPS_SYSTEM=y|system DMA-BUF heap (/dev/dma_heap/system); Android graphics buffers are allocated from it
+CONFIG_PSI=y|pressure stall information (/proc/pressure); Android lmkd and systemd-oomd read memory pressure from it'
 
 fail=0
 for cfg in $CONFIGS; do
