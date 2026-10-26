@@ -115,7 +115,7 @@ new file mode 100644
 index 000000000..608a68265
 --- /dev/null
 +++ b/net/tsi/af_tsi.c
-@@ -0,0 +1,1725 @@
+@@ -0,0 +1,1773 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +/*
 + * Transparent Socket Impersonation Driver
@@ -430,6 +430,17 @@ index 000000000..608a68265
 +
 +	pr_debug("%s: vsocket=%p isocket=%p\n", __func__, vsocket, isocket);
 +
++	/*
++	 * Already connected through the guest's inet stack: a repeat connect(),
++	 * which is how some callers finish a non-blocking connect, is answered
++	 * by that socket (-EISCONN) as the kernel would, instead of starting
++	 * over and falling through to the vsock proxy.
++	 */
++	if (tsk->status == S_INET && isocket) {
++		err = isocket->ops->connect(isocket, addr, addr_len, flags);
++		goto release;
++	}
++
 +	if (addr->sa_family != tsk->family) {
 +		pr_debug(
 +			"%s: rejecting mismatched family addr->sa_family=%d tsk->family=%d\n",
@@ -493,6 +504,20 @@ index 000000000..608a68265
 +		if (err == 0 || err == -EALREADY) {
 +			tsk->status = S_INET;
 +			pr_debug("%s: switching to CONNECTED_INET\n", __func__);
++			/*
++			 * The inet socket connected in the call because O_NONBLOCK
++			 * was cleared above, but a non-blocking TCP connect on Linux
++			 * never completes in the call: it returns -EINPROGRESS, and
++			 * the caller polls for POLLOUT and reads SO_ERROR. Answer
++			 * the same way, since callers written to that contract (the
++			 * Android emulator's adb client among them) treat an
++			 * immediate 0 as a failed connect. poll() reports the
++			 * connected inet socket writable, and SO_ERROR reads the
++			 * outer sock, which holds no error.
++			 */
++			if (err == 0 && (flags & O_NONBLOCK) &&
++			    sk->sk_type == SOCK_STREAM)
++				err = -EINPROGRESS;
 +			goto release;
 +		} else if (err == -EINPROGRESS) {
 +			/* This shouldn't happen, as we've cleared O_NONBLOCK */
@@ -1334,6 +1359,7 @@ index 000000000..608a68265
 +	struct tsi_sock *tsk;
 +	struct net *net;
 +	struct sock *listener;
++	bool found;
 +
 +	tsk = tsi_sk(sk);
 +
@@ -1361,6 +1387,7 @@ index 000000000..608a68265
 +		dport = sin->sin_port;
 +
 +		/* Check if anyone is listening on that destination address:port */
++		rcu_read_lock();
 +		listener = __udp4_lib_lookup(net,
 +					      0, 0,           /* source addr/port - don't care */
 +					      daddr, dport,   /* dest addr/port */
@@ -1368,10 +1395,17 @@ index 000000000..608a68265
 +					      net->ipv4.udp_table,
 +					      NULL);
 +
-+		if (listener) {
-+			sock_put(listener);  /* Release the reference */
++		/*
++		 * __udp*_lib_lookup() returns a socket borrowed under RCU
++		 * without taking a reference, so only its existence is used
++		 * and nothing is released: a sock_put() here dropped a
++		 * reference the lookup never took, underflowing the
++		 * listener's refcount on every send to it.
++		 */
++		found = listener != NULL;
++		rcu_read_unlock();
++		if (found)
 +			return true;
-+		}
 +	} else if (tsk->family == PF_INET6) {
 +		struct sockaddr_in6 *sin6;
 +		const struct in6_addr *daddr;
@@ -1388,6 +1422,7 @@ index 000000000..608a68265
 +		dport = sin6->sin6_port;
 +
 +		/* Check if anyone is listening on that destination address:port */
++		rcu_read_lock();
 +		listener = __udp6_lib_lookup(net,
 +					      NULL, 0,        /* source addr/port - don't care */
 +					      daddr, dport,   /* dest addr/port */
@@ -1395,10 +1430,17 @@ index 000000000..608a68265
 +					      net->ipv4.udp_table,
 +					      NULL);
 +
-+		if (listener) {
-+			sock_put(listener);  /* Release the reference */
++		/*
++		 * __udp*_lib_lookup() returns a socket borrowed under RCU
++		 * without taking a reference, so only its existence is used
++		 * and nothing is released: a sock_put() here dropped a
++		 * reference the lookup never took, underflowing the
++		 * listener's refcount on every send to it.
++		 */
++		found = listener != NULL;
++		rcu_read_unlock();
++		if (found)
 +			return true;
-+		}
 +	}
 +
 +	return false;
@@ -1444,6 +1486,7 @@ index 000000000..608a68265
 +		err = isocket->ops->sendmsg(isocket, msg, len);
 +		break;
 +	case S_HYBRID: {
++		struct iov_iter_state iter_state;
 +		bool has_local_listener;
 +
 +		/*
@@ -1457,15 +1500,20 @@ index 000000000..608a68265
 +		has_local_listener = tsi_has_udp_listener(sk, msg->msg_name,
 +							  msg->msg_namelen);
 +		if (has_local_listener) {
++			iov_iter_save_state(&msg->msg_iter, &iter_state);
 +			err = isocket->ops->sendmsg(isocket, msg, len);
 +			if (err >= 0)
 +				goto release;
 +			/*
-+			 * Genuine error (negative). Iterator might have been
-+			 * consumed if this is a late error (Type B).
++			 * The inet send failed, having consumed anywhere from
++			 * none of the payload (an early error such as
++			 * -ENETUNREACH from routing) to all of it. Restore the
++			 * iterator to where it was rather than reverting len:
++			 * reverting more than was consumed runs past the start
++			 * of a user buffer, which is a BUG() in iov_iter_revert.
 +			 * Fall through to vsock as last resort.
 +			 */
-+			iov_iter_revert(&msg->msg_iter, len);
++			iov_iter_restore(&msg->msg_iter, &iter_state);
 +		}
 +		/*
 +		 * No local listener OR inet failed - proxy via vsock to host.
