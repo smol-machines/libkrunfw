@@ -1,0 +1,40 @@
+virtio_net: let rx-checksumming be switched off
+
+The driver always sets NETIF_F_RXCSUM and never offers it in hw_features,
+so `ethtool -K eth0 rx off` fails with "Cannot change rx-checksumming" on
+every virtio NIC. Workflows written for GitHub's runners run exactly that
+command (the actions/runner-images#1187 workaround), and it succeeds on
+their NICs.
+
+Trusting the device's DATA_VALID mark is the driver's choice alone, so the
+feature can be switched without a device command: offer it in hw_features,
+and while it is off clear DATA_VALID before the checksum offload is handled,
+so the stack verifies the checksum itself. Partially checksummed packets
+(NEEDS_CSUM) are valid either way, as the probe comment says.
+
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -2591,6 +2591,12 @@
+ 	if (dev->features & NETIF_F_RXHASH && vi->has_rss_hash_report)
+ 		virtio_skb_set_hash(&hdr->hash_v1_hdr, skb);
+ 
++	/* With rx-checksumming switched off, a checksum the device validated is
++	 * not trusted: the stack verifies it. Partially checksummed packets stay
++	 * valid as they are (see virtnet_probe()).
++	 */
++	if (!(dev->features & NETIF_F_RXCSUM))
++		flags &= ~VIRTIO_NET_HDR_F_DATA_VALID;
+ 	hdr->hdr.flags = flags;
+ 	if (virtio_net_handle_csum_offload(skb, &hdr->hdr, vi->rx_tnl_csum)) {
+ 		net_warn_ratelimited("%s: bad csum: flags: %x, gso_type: %x rx_tnl_csum %d\n",
+@@ -6901,6 +6907,10 @@
+ 	 * validating these packets' checksums, so the driver won't have to.
+ 	 */
+ 	dev->features |= NETIF_F_RXCSUM;
++	/* Trusting the device's validation is the driver's choice alone, so it
++	 * can be switched off (ethtool -K <dev> rx off) without a device command.
++	 */
++	dev->hw_features |= NETIF_F_RXCSUM;
+ 
+ 	if (virtio_has_feature(vdev, VIRTIO_NET_F_GUEST_TSO4) ||
+ 	    virtio_has_feature(vdev, VIRTIO_NET_F_GUEST_TSO6))
