@@ -1,0 +1,446 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: BinBin He <hebinsquared@gmail.com>
+Date: Sun, 8 Nov 2026 07:45:55 -0800
+Subject: [PATCH] tsi: keep UDP between guest sockets in the guest
+
+A TSI datagram socket could not talk to another socket of the same guest:
+a server read with epoll never woke for a datagram from inside the guest
+(poll only looked at the vsock half), a reply to a connected client went to
+the host (the listener lookup ignored connected sockets), and a socket that
+had sent anything to the outside read only the vsock half from then on.
+Local DNS stubs, statsd and syslog mocks, QUIC tests and every UDP service
+in a container on a guest bridge were unreachable from inside the guest.
+
+Route each datagram by its destination instead: one of the sender's own
+addresses (127.0.0.0/8, ::1, every address of its network namespace), a
+peer the sender reaches without a gateway (a container on a guest bridge),
+or, from a container's namespace, an address of the guest itself goes
+through the guest's own stack; anything else goes to the host proxy exactly
+as before. Receive and poll from both halves unless the socket is connected
+through one of them, and wait on both halves in a blocking receive.
+---
+ net/tsi/af_tsi.c | 365 +++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 308 insertions(+), 57 deletions(-)
+
+diff --git a/net/tsi/af_tsi.c b/net/tsi/af_tsi.c
+index 7c3e0c4..c051598 100644
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -18,6 +18,7 @@
+ #include <net/inet_hashtables.h>
+ #include <net/ipv6.h>
+ #include <net/addrconf.h>
++#include <net/ip6_route.h>
+ #include "af_tsi.h"
+ 
+ /* TSI for IPv4 family. */
+@@ -816,6 +817,210 @@ static int tsi_getname(struct socket *sock, struct sockaddr *addr, int peer)
+ 	return err;
+ }
+ 
++/*
++ * Datagram sockets inside the guest
++ * =================================
++ *
++ * A TSI datagram socket has two halves: the inet socket, which is the
++ * guest's own UDP stack, and the vsock socket, through which the host
++ * proxies traffic to and from the outside. Traffic between two sockets of the
++ * same guest has to stay on the inet half end to end: the request, the
++ * reply, and every later datagram, whatever the socket has sent to the
++ * outside in between. So a datagram socket
++ *
++ *  - sends to a destination inside the guest (tsi_dgram_via_guest()) through
++ *    the inet half and everything else through the proxy, decided per
++ *    datagram, whatever state the socket is in;
++ *  - receives from both halves, unless it is connected through one of them
++ *    (tsi_dgram_reads_inet(), tsi_dgram_reads_vsock());
++ *  - polls both halves, so an event-driven reader (epoll) sees a datagram
++ *    from inside the guest as well as one the proxy delivered.
++ */
++
++/* Where a datagram for a destination goes. */
++enum tsi_dgram_route {
++	/* Through the guest's own stack. */
++	TSI_ROUTE_GUEST,
++	/* Through the host proxy. */
++	TSI_ROUTE_HOST,
++	/* Broadcast and multicast: to the guest if a guest socket listens. */
++	TSI_ROUTE_LISTENER,
++};
++
++/*
++ * A destination is inside the guest when it is one of the sender's own
++ * addresses (127.0.0.0/8 and every address of its network namespace), when
++ * the sender's routing reaches it without a gateway (a peer on a guest
++ * bridge, such as a container), or, for a sender in a container's namespace,
++ * when it is an address of the guest itself, which that container reaches
++ * through its gateway. Anything the sender has no route to, or reaches only
++ * through a gateway, is outside and goes to the host as before.
++ */
++static enum tsi_dgram_route tsi_dgram_route4(struct sock *isk, __be32 daddr)
++{
++	struct net *net = sock_net(isk);
++	enum tsi_dgram_route route;
++	struct flowi4 fl4;
++	struct rtable *rt;
++
++	if (ipv4_is_multicast(daddr) || ipv4_is_lbcast(daddr))
++		return TSI_ROUTE_LISTENER;
++	if (ipv4_is_loopback(daddr) || inet_addr_type(net, daddr) == RTN_LOCAL)
++		return TSI_ROUTE_GUEST;
++
++	memset(&fl4, 0, sizeof(fl4));
++	fl4.daddr = daddr;
++	fl4.flowi4_oif = isk->sk_bound_dev_if;
++	fl4.flowi4_proto = IPPROTO_UDP;
++	rt = ip_route_output_key(net, &fl4);
++	if (IS_ERR(rt))
++		return TSI_ROUTE_HOST;
++
++	switch (rt->rt_type) {
++	case RTN_LOCAL:
++		route = TSI_ROUTE_GUEST;
++		break;
++	case RTN_BROADCAST:
++	case RTN_MULTICAST:
++		route = TSI_ROUTE_LISTENER;
++		break;
++	case RTN_UNICAST:
++		if (!rt->rt_uses_gateway)
++			route = TSI_ROUTE_GUEST;
++		else if (!net_eq(net, &init_net) &&
++			 inet_addr_type(&init_net, daddr) == RTN_LOCAL)
++			route = TSI_ROUTE_GUEST;
++		else
++			route = TSI_ROUTE_HOST;
++		break;
++	default:
++		route = TSI_ROUTE_HOST;
++	}
++	ip_rt_put(rt);
++	return route;
++}
++
++#if IS_ENABLED(CONFIG_IPV6)
++static enum tsi_dgram_route tsi_dgram_route6(struct sock *isk,
++					     const struct in6_addr *daddr)
++{
++	struct net *net = sock_net(isk);
++	enum tsi_dgram_route route;
++	struct dst_entry *dst;
++	struct flowi6 fl6;
++
++	if (ipv6_addr_v4mapped(daddr))
++		return tsi_dgram_route4(isk, daddr->s6_addr32[3]);
++	if (ipv6_addr_is_multicast(daddr))
++		return TSI_ROUTE_LISTENER;
++	if (ipv6_addr_loopback(daddr) || ipv6_chk_addr(net, daddr, NULL, 0))
++		return TSI_ROUTE_GUEST;
++
++	memset(&fl6, 0, sizeof(fl6));
++	fl6.daddr = *daddr;
++	fl6.flowi6_oif = isk->sk_bound_dev_if;
++	fl6.flowi6_proto = IPPROTO_UDP;
++	dst = ip6_route_output(net, NULL, &fl6);
++	if (dst->error)
++		route = TSI_ROUTE_HOST;
++	else if (!(dst_rt6_info(dst)->rt6i_flags & RTF_GATEWAY))
++		route = TSI_ROUTE_GUEST;
++	else if (!net_eq(net, &init_net) &&
++		 ipv6_chk_addr(&init_net, daddr, NULL, 0))
++		route = TSI_ROUTE_GUEST;
++	else
++		route = TSI_ROUTE_HOST;
++	dst_release(dst);
++	return route;
++}
++#endif
++
++static bool tsi_has_udp_listener(struct sock *sk, struct sockaddr *addr,
++				 int addr_len);
++
++/* Whether a datagram to @addr goes through the guest's own stack. */
++static bool tsi_dgram_via_guest(struct sock *sk, struct sockaddr *addr,
++				int addr_len)
++{
++	struct tsi_sock *tsk = tsi_sk(sk);
++	struct sock *isk = tsk->isocket->sk;
++	enum tsi_dgram_route route = TSI_ROUTE_HOST;
++
++	if (!addr)
++		return false;
++	if (tsk->family == PF_INET && addr_len >= sizeof(struct sockaddr_in) &&
++	    addr->sa_family == AF_INET)
++		route = tsi_dgram_route4(isk,
++					 ((struct sockaddr_in *)addr)->sin_addr.s_addr);
++#if IS_ENABLED(CONFIG_IPV6)
++	else if (tsk->family == PF_INET6 &&
++		 addr_len >= sizeof(struct sockaddr_in6) &&
++		 addr->sa_family == AF_INET6)
++		route = tsi_dgram_route6(isk,
++					 &((struct sockaddr_in6 *)addr)->sin6_addr);
++#endif
++
++	switch (route) {
++	case TSI_ROUTE_GUEST:
++		return true;
++	case TSI_ROUTE_LISTENER:
++		return tsi_has_udp_listener(sk, addr, addr_len);
++	default:
++		return false;
++	}
++}
++
++/* Whether a datagram socket reads its inet half. */
++static bool tsi_dgram_reads_inet(struct tsi_sock *tsk)
++{
++	/* Only a socket connected through the proxy reads the proxy alone. */
++	return !(tsk->status == S_VSOCK &&
++		 READ_ONCE(tsk->vsocket->state) == SS_CONNECTED);
++}
++
++/* Whether a datagram socket reads its vsock half. */
++static bool tsi_dgram_reads_vsock(struct tsi_sock *tsk)
++{
++	/* Data arrives there only once the proxy has a flow for the socket. */
++	return tsk->status == S_VSOCK ||
++	       (tsk->status == S_HYBRID && READ_ONCE(tsk->svm_port));
++}
++
++static __poll_t tsi_dgram_poll(struct file *file, struct socket *sock,
++			       poll_table *wait)
++{
++	struct sock *sk = sock->sk;
++	struct tsi_sock *tsk = tsi_sk(sk);
++	struct socket *isocket = tsk->isocket;
++	struct socket *vsocket = tsk->vsocket;
++	__poll_t imask, vmask, events = 0;
++
++	/*
++	 * Always register on both halves: epoll registers its wait-queue
++	 * entries only once, when the socket is added, so a half left out now
++	 * could never wake it later.
++	 */
++	imask = isocket->ops->poll(file, isocket, wait);
++	vmask = vsocket ? vsocket->ops->poll(file, vsocket, wait) : 0;
++
++	lock_sock(sk);
++	if (tsk->status == S_INET) {
++		events = imask;
++		sk->sk_err = isocket->sk->sk_err;
++	} else if (!tsi_dgram_reads_inet(tsk)) {
++		events = vmask;
++		sk->sk_err = vsocket->sk->sk_err;
++	} else {
++		/* Writable through the inet half; readable from either. */
++		events = imask;
++		if (tsi_dgram_reads_vsock(tsk))
++			events |= vmask & (EPOLLIN | EPOLLRDNORM | EPOLLERR);
++		sk->sk_err = isocket->sk->sk_err;
++	}
++	release_sock(sk);
++	return events;
++}
++
+ static __poll_t tsi_poll(struct file *file, struct socket *sock,
+ 			 poll_table *wait)
+ {
+@@ -825,6 +1030,9 @@ static __poll_t tsi_poll(struct file *file, struct socket *sock,
+ 	struct socket *vsocket;
+ 	__poll_t events = 0;
+ 
++	if (sock->type == SOCK_DGRAM)
++		return tsi_dgram_poll(file, sock, wait);
++
+ 	lock_sock(sk);
+ 	tsk = tsi_sk(sock->sk);
+ 	isocket = tsk->isocket;
+@@ -1379,44 +1587,19 @@ static int tsi_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
+ 	case S_INET:
+ 		err = isocket->ops->sendmsg(isocket, msg, len);
+ 		break;
+-	case S_HYBRID: {
+-		struct iov_iter_state iter_state;
+-		bool has_local_listener;
+-
++	case S_HYBRID:
++	case S_VSOCK:
+ 		/*
+-		 * For datagram sockets, we need to decide whether to send via
+-		 * the guest's inet stack or proxy via vsock to the host.
+-		 *
+-		 * Strategy: Check if there's a listener in the guest. If yes,
+-		 * send via inet (guest priority). If no, proxy via vsock to
+-		 * reach host.
++		 * Per datagram, whatever the socket sent before: a destination
++		 * inside the guest through the guest's own stack, anything else
++		 * through the proxy below. A socket connected through the proxy
++		 * sends without a name and keeps using its flow.
+ 		 */
+-		has_local_listener = tsi_has_udp_listener(sk, msg->msg_name,
+-							  msg->msg_namelen);
+-		if (has_local_listener) {
+-			iov_iter_save_state(&msg->msg_iter, &iter_state);
++		if (msg->msg_name &&
++		    tsi_dgram_via_guest(sk, msg->msg_name, msg->msg_namelen)) {
+ 			err = isocket->ops->sendmsg(isocket, msg, len);
+-			if (err >= 0)
+-				goto release;
+-			/*
+-			 * The inet send failed, having consumed anywhere from
+-			 * none of the payload (an early error such as
+-			 * -ENETUNREACH from routing) to all of it. Restore the
+-			 * iterator to where it was rather than reverting len:
+-			 * reverting more than was consumed runs past the start
+-			 * of a user buffer, which is a BUG() in iov_iter_revert.
+-			 * Fall through to vsock as last resort.
+-			 */
+-			iov_iter_restore(&msg->msg_iter, &iter_state);
++			break;
+ 		}
+-		/*
+-		 * No local listener OR inet failed - proxy via vsock to host.
+-		 * This is the common case when guest apps try to reach host
+-		 * services.
+-		 */
+-		fallthrough;
+-	}
+-	case S_VSOCK:
+ 		if (msg->msg_name) {
+ 			pr_debug("%s: fixing msg_name for vsock proxy\n",
+ 				 __func__);
+@@ -1504,43 +1687,111 @@ static int tsi_stream_recvmsg(struct socket *sock, struct msghdr *msg,
+ 	return err;
+ }
+ 
++/* Receive one datagram the proxy delivered, naming the peer it came from. */
++static int tsi_dgram_recv_vsock(struct tsi_sock *tsk, struct msghdr *msg,
++				size_t len, int flags)
++{
++	struct sock *sk = sk_tsi(tsk);
++	int err;
++
++	err = tsk->vsocket->ops->recvmsg(tsk->vsocket, msg, len, flags);
++	if (err > 0 && msg && msg->msg_name) {
++		lock_sock(sk);
++		if (tsk->sendto_addr) {
++			memcpy(msg->msg_name, tsk->sendto_addr,
++			       tsk->sendto_addr_len);
++			msg->msg_namelen = tsk->sendto_addr_len;
++		}
++		release_sock(sk);
++	}
++	return err;
++}
++
++/* One reader waiting on both halves of a datagram socket. */
++struct tsi_dgram_waiter {
++	struct wait_queue_entry inet;
++	struct wait_queue_entry vsock;
++	struct task_struct *task;
++	bool woken;
++};
++
++static int tsi_dgram_wake(struct wait_queue_entry *entry, unsigned int mode,
++			  int sync, void *key)
++{
++	struct tsi_dgram_waiter *waiter = entry->private;
++
++	WRITE_ONCE(waiter->woken, true);
++	return wake_up_process(waiter->task);
++}
++
+ static int tsi_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
+ 			     size_t len, int flags)
+ {
+ 	struct sock *sk = sock->sk;
+-	struct tsi_sock *tsk;
+-	struct socket *isocket;
+-	struct socket *vsocket;
++	struct tsi_sock *tsk = tsi_sk(sk);
++	struct socket *isocket = tsk->isocket;
++	struct socket *vsocket = tsk->vsocket;
++	struct tsi_dgram_waiter waiter;
++	bool inet_only, vsock_only;
++	long timeo;
+ 	int err;
+ 
+ 	lock_sock(sk);
+-	tsk = tsi_sk(sock->sk);
+-	isocket = tsk->isocket;
+-	vsocket = tsk->vsocket;
++	inet_only = tsk->status == S_INET;
++	vsock_only = !inet_only && !tsi_dgram_reads_inet(tsk);
++	release_sock(sk);
+ 
+ 	pr_debug("%s: s=%p vs=%p is=%p st=%d family=%d\n", __func__, sock,
+ 		 vsocket, isocket, tsk->status, tsk->family);
+ 
+-	switch (tsk->status) {
+-	case S_HYBRID:
+-	case S_INET:
+-		err = isocket->ops->recvmsg(isocket, msg, len, flags);
+-		break;
+-	case S_VSOCK:
+-		err = vsocket->ops->recvmsg(vsocket, msg, len, flags);
+-		if (err > 0 && msg && msg->msg_name && tsk->sendto_addr) {
+-			pr_debug(
+-				"%s: msg_name=%p sendto_addr=%p, msg_len=%d addr_len=%d\n",
+-				__func__, msg->msg_name, tsk->sendto_addr,
+-				msg->msg_namelen, tsk->sendto_addr_len);
+-			memcpy(msg->msg_name, tsk->sendto_addr,
+-			       tsk->sendto_addr_len);
+-			msg->msg_namelen = tsk->sendto_addr_len;
++	/* Errors queued by the guest's stack (IP_RECVERR) live there alone. */
++	if (inet_only || (flags & MSG_ERRQUEUE))
++		return isocket->ops->recvmsg(isocket, msg, len, flags);
++	if (vsock_only)
++		return tsi_dgram_recv_vsock(tsk, msg, len, flags);
++
++	/*
++	 * Either half may hold the next datagram: try each without blocking,
++	 * and sleep until either has data. The wait-queue entries go on both
++	 * halves before the first attempt, so a datagram arriving between an
++	 * attempt and the sleep still wakes this reader.
++	 */
++	timeo = sock_rcvtimeo(isocket->sk, flags & MSG_DONTWAIT);
++	waiter.task = current;
++	waiter.woken = false;
++	init_waitqueue_func_entry(&waiter.inet, tsi_dgram_wake);
++	waiter.inet.private = &waiter;
++	init_waitqueue_func_entry(&waiter.vsock, tsi_dgram_wake);
++	waiter.vsock.private = &waiter;
++	add_wait_queue(sk_sleep(isocket->sk), &waiter.inet);
++	add_wait_queue(sk_sleep(vsocket->sk), &waiter.vsock);
++
++	for (;;) {
++		err = isocket->ops->recvmsg(isocket, msg, len,
++					    flags | MSG_DONTWAIT);
++		if (err != -EAGAIN)
++			break;
++		if (tsi_dgram_reads_vsock(tsk)) {
++			err = tsi_dgram_recv_vsock(tsk, msg, len,
++						   flags | MSG_DONTWAIT);
++			if (err != -EAGAIN)
++				break;
+ 		}
+-		break;
++		if (!timeo)
++			break;
++		if (signal_pending(current)) {
++			err = sock_intr_errno(timeo);
++			break;
++		}
++		set_current_state(TASK_INTERRUPTIBLE);
++		if (!READ_ONCE(waiter.woken))
++			timeo = schedule_timeout(timeo);
++		__set_current_state(TASK_RUNNING);
++		WRITE_ONCE(waiter.woken, false);
+ 	}
+ 
+-	release_sock(sk);
++	remove_wait_queue(sk_sleep(vsocket->sk), &waiter.vsock);
++	remove_wait_queue(sk_sleep(isocket->sk), &waiter.inet);
+ 	return err;
+ }
+ 
