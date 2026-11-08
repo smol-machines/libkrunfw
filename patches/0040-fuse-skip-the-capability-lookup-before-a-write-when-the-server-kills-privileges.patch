@@ -1,19 +1,16 @@
 fuse: skip the capability lookup before a write when the server kills privileges
 
-Before the first write to a regular file, file_remove_privs() asks whether the
-file carries security.capability, which on FUSE is a GETXATTR round trip to the
-server (on virtiofs here about 60 us, synchronous in the write path). The
-answer is never acted on when the server negotiated FUSE_HANDLE_KILLPRIV_V2:
-the kernel already marks every unprivileged write with FUSE_WRITE_KILL_SUIDGID
-and leaves killing suid, sgid and the capability to the server. The VFS caches
-a negative answer in S_NOSEC, so only the first write to each inode pays, but
-a tree of 34,500 small files written once pays 34,500 times (about 2 s of a
-31 s install).
+Before the first write to a regular file, file_remove_privs() asks whether the file carries security.capability,
+which on FUSE is a GETXATTR round trip to the server (on virtiofs here about 60 us, synchronous in the write path).
+The answer is never acted on when the server negotiated FUSE_HANDLE_KILLPRIV_V2: the kernel already marks every
+unprivileged write with FUSE_WRITE_KILL_SUIDGID and leaves killing suid, sgid and the capability to the server. The
+VFS caches a negative answer in S_NOSEC, but fuse_change_attributes_common() clears that flag on every attribute
+refresh (another client might have set a capability), and a created file's attributes are refreshed at once, so every
+file paid once: an npm ci of 34,500 files into a bind mount sent 34,900 such requests.
 
-Mark a regular file's inode S_NOSEC as soon as it is created when the server
-handles privileges (inode_has_no_xattr() does so under SB_NOSEC, which such a
-connection sets, and only for a file without suid or sgid bits). The VFS still
-clears S_NOSEC when a chmod gives the file those bits, and a write to a file
+Mark a regular file's inode S_NOSEC when it is created and keep the flag across attribute refreshes when the server
+handles privileges (inode_has_no_xattr() sets it under SB_NOSEC, which such a connection sets, and only for a file
+without suid or sgid bits). The VFS still clears S_NOSEC when a chmod gives the file those bits, and a write to a file
 that gained them on the server's side is still stripped by the server.
 
 Signed-off-by: smolvm <noreply@smolvm>
@@ -21,7 +18,23 @@ Signed-off-by: smolvm <noreply@smolvm>
 diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
 --- a/fs/fuse/inode.c
 +++ b/fs/fuse/inode.c
-@@ -510,6 +510,14 @@ retry:
+@@ -311,8 +311,14 @@
+ 	 * was set or if security.capability xattr was set. But we don't
+ 	 * know if security.capability has been set or not. So clear it
+ 	 * anyway. Its less efficient but should be safe.
++	 *
++	 * Unless the server handles privileges (FUSE_HANDLE_KILLPRIV_V2):
++	 * it strips suid, sgid and the capability on every write it is
++	 * told to, whatever another client set, so the flag can stay and
++	 * the first write to each file is spared a GETXATTR.
+ 	 */
+-	inode->i_flags &= ~S_NOSEC;
++	if (!fc->handle_killpriv_v2)
++		inode->i_flags &= ~S_NOSEC;
+ }
+ 
+ u32 fuse_get_cache_mask(struct inode *inode)
+@@ -511,6 +517,14 @@
  			inode->i_flags |= S_NOCMTIME;
  		inode->i_generation = generation;
  		fuse_init_inode(inode, attr, fc);
