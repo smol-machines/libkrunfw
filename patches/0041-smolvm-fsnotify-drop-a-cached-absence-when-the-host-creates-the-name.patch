@@ -16,7 +16,15 @@ Signed-off-by: smolvm <noreply@smolvm>
 diff --git a/fs/notify/smolvm_inject.c b/fs/notify/smolvm_inject.c
 --- a/fs/notify/smolvm_inject.c
 +++ b/fs/notify/smolvm_inject.c
-@@ -38,6 +38,51 @@
+@@ -26,6 +26,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/namei.h>
+ #include <linux/dcache.h>
++#include <linux/stringhash.h>
+ #include <linux/fsnotify.h>
+ #include <linux/fs.h>
+ #include <linux/magic.h>
+@@ -38,6 +39,50 @@
  /* Bound a single request: an FS_* mask in hex plus one absolute path. */
  #define SMOLVM_FSNOTIFY_MAX (PATH_MAX + 32)
  
@@ -45,9 +53,8 @@ diff --git a/fs/notify/smolvm_inject.c b/fs/notify/smolvm_inject.c
 +
 +	qname.name = (const unsigned char *)(slash + 1);
 +	qname.len = strlen(slash + 1);
-+	child = d_hash_and_lookup(parent.dentry, &qname);
-+	if (IS_ERR(child))
-+		child = NULL;
++	qname.hash = full_name_hash(parent.dentry, qname.name, qname.len);
++	child = d_lookup(parent.dentry, &qname);
 +	if (child) {
 +		/*
 +		 * A positive dentry here would have resolved above; this is the

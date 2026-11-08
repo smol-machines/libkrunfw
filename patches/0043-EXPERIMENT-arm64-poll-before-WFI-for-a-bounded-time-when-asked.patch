@@ -1,0 +1,81 @@
+EXPERIMENT: arm64 idle spins for up to /proc/smolvm-idle-poll-us before WFI
+
+Signed-off-by: smolvm <noreply@smolvm>
+---
+diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
+--- a/arch/arm64/kernel/idle.c
++++ b/arch/arm64/kernel/idle.c
+@@ -5,6 +5,11 @@
+ 
+ #include <linux/cpu.h>
+ #include <linux/irqflags.h>
++#include <linux/proc_fs.h>
++#include <linux/uaccess.h>
++#include <linux/sched.h>
++#include <linux/sched/clock.h>
++#include <linux/kstrtox.h>
+ 
+ #include <asm/barrier.h>
+ #include <asm/cpuidle.h>
+@@ -33,10 +38,61 @@
+ }
+ 
+ /*
++ * smolvm EXPERIMENT: before sleeping in WFI, spin for up to
++ * /proc/smolvm-idle-poll-us microseconds with interrupts enabled, so a
++ * completion that arrives right after the CPU went idle (the common case for
++ * a thread waiting on a virtiofs reply) is taken without the wake-from-WFI
++ * cost. Zero (the default) is the unchanged behaviour.
++ */
++static u64 smolvm_idle_poll_ns;
++
++static ssize_t smolvm_idle_poll_write(struct file *file, const char __user *ubuf,
++				      size_t count, loff_t *ppos)
++{
++	char buf[16];
++	unsigned long us;
++
++	if (count == 0 || count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, count))
++		return -EFAULT;
++	buf[count] = '\0';
++	if (kstrtoul(buf, 10, &us) || us > 10000)
++		return -EINVAL;
++	WRITE_ONCE(smolvm_idle_poll_ns, (u64)us * 1000);
++	return count;
++}
++
++static const struct proc_ops smolvm_idle_poll_ops = {
++	.proc_write	= smolvm_idle_poll_write,
++	.proc_lseek	= noop_llseek,
++};
++
++static int __init smolvm_idle_poll_init(void)
++{
++	proc_create("smolvm-idle-poll-us", 0200, NULL, &smolvm_idle_poll_ops);
++	return 0;
++}
++late_initcall(smolvm_idle_poll_init);
++
++/*
+  * This is our default idle handler.
+  */
+ void __cpuidle arch_cpu_idle(void)
+ {
++	u64 poll_ns = READ_ONCE(smolvm_idle_poll_ns);
++
++	if (poll_ns) {
++		u64 deadline = local_clock() + poll_ns;
++
++		raw_local_irq_enable();
++		while (!need_resched() && local_clock() < deadline)
++			cpu_relax();
++		raw_local_irq_disable();
++		if (need_resched())
++			return;
++	}
++
+ 	/*
+ 	 * This should do all the clock switching and wait for interrupt
+ 	 * tricks

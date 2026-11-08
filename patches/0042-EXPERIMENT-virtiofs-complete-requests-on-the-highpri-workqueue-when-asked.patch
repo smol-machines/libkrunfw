@@ -1,0 +1,60 @@
+EXPERIMENT: virtiofs completes requests on the high-priority workqueue when /proc/smolvm-vfs-highpri is 1
+
+Signed-off-by: smolvm <noreply@smolvm>
+---
+diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -19,9 +19,40 @@
+ #include <linux/highmem.h>
+ #include <linux/cleanup.h>
+ #include <linux/uio.h>
++#include <linux/proc_fs.h>
+ #include "fuse_i.h"
+ #include "fuse_dev_i.h"
+ 
++/*
++ * smolvm EXPERIMENT: complete requests from the high-priority system
++ * workqueue when /proc/smolvm-vfs-highpri holds 1, to shorten the wake of
++ * the worker that ends each request.
++ */
++static bool smolvm_vfs_highpri;
++
++static ssize_t smolvm_vfs_highpri_write(struct file *file, const char __user *ubuf,
++					size_t count, loff_t *ppos)
++{
++	char c;
++
++	if (count < 1 || get_user(c, ubuf))
++		return -EFAULT;
++	WRITE_ONCE(smolvm_vfs_highpri, c == '1');
++	return count;
++}
++
++static const struct proc_ops smolvm_vfs_highpri_ops = {
++	.proc_write	= smolvm_vfs_highpri_write,
++	.proc_lseek	= noop_llseek,
++};
++
++static int __init smolvm_vfs_highpri_init(void)
++{
++	proc_create("smolvm-vfs-highpri", 0200, NULL, &smolvm_vfs_highpri_ops);
++	return 0;
++}
++late_initcall(smolvm_vfs_highpri_init);
++
+ /* Used to help calculate the FUSE connection's max_pages limit for a request's
+  * size. Parts of the struct fuse_req are sliced into scattergather lists in
+  * addition to the pages used, so this can help account for that overhead.
+@@ -901,7 +932,10 @@
+ 
+ 	dev_dbg(&vq->vdev->dev, "%s %s\n", __func__, fsvq->name);
+ 
+-	schedule_work(&fsvq->done_work);
++	if (READ_ONCE(smolvm_vfs_highpri))
++		queue_work(system_highpri_wq, &fsvq->done_work);
++	else
++		schedule_work(&fsvq->done_work);
+ }
+ 
+ static void virtio_fs_init_vq(struct virtio_fs_vq *fsvq, char *name,
