@@ -1,0 +1,128 @@
+arm64: poll adaptively before WFI, when asked through /proc/smolvm-idle-poll-us
+
+A thread waiting on a virtiofs reply puts its CPU into WFI, and the reply's interrupt then has to wake the vCPU: on a
+macOS host that wake is most of a round trip (a statvfs on a bind mount took 45 us, of which 36 us between the host's
+completion and the guest's next request). Polling briefly before sleeping takes the wake out of that path.
+
+The idle handler spins with interrupts enabled for a per-CPU window before WFI, and the window adapts as
+cpuidle-haltpoll does: it grows when a wake arrived during the poll or soon after the CPU gave up and slept, and
+shrinks toward nothing when a sleep was long, so a CPU that idles for long stretches soon spends nothing on it.
+/proc/smolvm-idle-poll-us sets the ceiling (at most 10 ms); it is 0 by default, which is the unchanged behaviour, and
+the host side turns it on where it has been measured.
+
+Measured on an M1 Pro with a 50 us ceiling against 0 on the same kernel: 45 -> 24 us per synchronous round trip on
+the statvfs loop, npm ci into a bind mount 27.6 -> 26.6 s; VMM CPU of an idle machine 1.2% -> 1.3%, of an idle-heavy
+guest (four threads of 200 us sleeps) 16.3% -> 15.2%, summed over eight idle machines 1.2% -> 1.6%.
+
+Signed-off-by: smolvm <noreply@smolvm>
+---
+diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
+--- a/arch/arm64/kernel/idle.c
++++ b/arch/arm64/kernel/idle.c
+@@ -5,6 +5,13 @@
+ 
+ #include <linux/cpu.h>
+ #include <linux/irqflags.h>
++#include <linux/proc_fs.h>
++#include <linux/uaccess.h>
++#include <linux/sched.h>
++#include <linux/sched/clock.h>
++#include <linux/kstrtox.h>
++#include <linux/percpu.h>
++#include <linux/minmax.h>
+ 
+ #include <asm/barrier.h>
+ #include <asm/cpuidle.h>
+@@ -33,13 +40,92 @@
+ }
+ 
+ /*
++ * smolvm: adaptive poll before WFI, as cpuidle-haltpoll does. A CPU going
++ * idle spins with interrupts enabled for a per-CPU window before
++ * sleeping in WFI, so a wake that arrives right away (a thread waiting on a
++ * virtiofs reply) costs no wake-from-WFI. The window grows when a wake came
++ * during the poll or soon after the CPU gave up and slept, and shrinks when
++ * the sleep turned out long, so a CPU that idles for long stretches soon
++ * polls for nothing. /proc/smolvm-idle-poll-us sets the ceiling; 0 (the
++ * default) disables it.
++ */
++static u64 smolvm_idle_poll_max_ns;
++static DEFINE_PER_CPU(u64, smolvm_idle_poll_ns);
++
++#define SMOLVM_IDLE_POLL_MIN_NS	2000ULL
++
++static ssize_t smolvm_idle_poll_write(struct file *file, const char __user *ubuf,
++				      size_t count, loff_t *ppos)
++{
++	char buf[16];
++	unsigned long us;
++
++	if (count == 0 || count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, count))
++		return -EFAULT;
++	buf[count] = '\0';
++	if (kstrtoul(buf, 10, &us) || us > 10000)
++		return -EINVAL;
++	WRITE_ONCE(smolvm_idle_poll_max_ns, (u64)us * 1000);
++	return count;
++}
++
++static const struct proc_ops smolvm_idle_poll_ops = {
++	.proc_write	= smolvm_idle_poll_write,
++	.proc_lseek	= noop_llseek,
++};
++
++static int __init smolvm_idle_poll_init(void)
++{
++	proc_create("smolvm-idle-poll-us", 0200, NULL, &smolvm_idle_poll_ops);
++	return 0;
++}
++late_initcall(smolvm_idle_poll_init);
++
++/*
+  * This is our default idle handler.
+  */
+ void __cpuidle arch_cpu_idle(void)
+ {
++	u64 max_ns = READ_ONCE(smolvm_idle_poll_max_ns);
++	u64 *window = NULL;
++	u64 before, slept;
++
++	if (max_ns) {
++		u64 ns;
++
++		window = this_cpu_ptr(&smolvm_idle_poll_ns);
++		ns = min(*window, max_ns);
++		if (ns) {
++			u64 deadline = local_clock() + ns;
++
++			raw_local_irq_enable();
++			while (!need_resched() && local_clock() < deadline)
++				cpu_relax();
++			raw_local_irq_disable();
++			if (need_resched()) {
++				/* Caught during the poll: poll longer next time. */
++				*window = min(ns * 2, max_ns);
++				return;
++			}
++		}
++	}
++
+ 	/*
+ 	 * This should do all the clock switching and wait for interrupt
+ 	 * tricks
+ 	 */
++	before = local_clock();
+ 	cpu_do_idle();
++	if (!window)
++		return;
++	slept = local_clock() - before;
++	if (slept < max_ns) {
++		/* Woke soon after giving up: a longer poll would have caught it. */
++		*window = min(max(*window * 2, SMOLVM_IDLE_POLL_MIN_NS), max_ns);
++	} else if (slept > 4 * max_ns) {
++		/* A long sleep: polling was wasted; poll less, down to nothing. */
++		*window /= 2;
++	}
+ }
