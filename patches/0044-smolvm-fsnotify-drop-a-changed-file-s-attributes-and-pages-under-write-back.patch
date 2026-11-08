@@ -1,0 +1,39 @@
+smolvm: fsnotify inject: drop a changed file's attributes and pages, for a write-back cache
+
+When the virtiofs server offers a write-back cache, the guest kernel keeps a regular file's size, mtime and pages as
+its own and ignores what the server reports, so a change the host makes to the file would stay invisible to the guest
+until the inode is dropped. The injected event for a host change now drops the file's attributes and its clean pages,
+so the next stat or read goes to the server; pages the guest has dirtied are left alone and the guest's write wins.
+Without a write-back cache the server's attributes already carried the change, and this adds nothing the kernel was
+not about to do.
+
+Signed-off-by: smolvm <noreply@smolvm>
+---
+diff --git a/fs/notify/smolvm_inject.c b/fs/notify/smolvm_inject.c
+--- a/fs/notify/smolvm_inject.c
++++ b/fs/notify/smolvm_inject.c
+@@ -144,8 +144,23 @@
+ 		take_dentry_name_snapshot(&name, path.dentry);
+ 	}
+ #if IS_ENABLED(CONFIG_FUSE_FS)
+-	if (path.dentry->d_sb->s_magic == FUSE_SUPER_MAGIC)
++	if (path.dentry->d_sb->s_magic == FUSE_SUPER_MAGIC) {
+ 		fuse_invalidate_entry_cache(path.dentry);
++		/*
++		 * With a write-back cache the kernel trusts its own size, mtime
++		 * and pages for a regular file and ignores what the server
++		 * reports, so a host change would stay invisible: drop the
++		 * attributes and the clean pages here. Dirty pages (the guest is
++		 * writing the same file) are left alone; the guest's write wins.
++		 */
++		if (d_really_is_positive(path.dentry) &&
++		    S_ISREG(d_inode(path.dentry)->i_mode)) {
++			struct inode *inode = d_inode(path.dentry);
++
++			fuse_invalidate_attr(inode);
++			invalidate_inode_pages2(inode->i_mapping);
++		}
++	}
+ #endif
+ 	if (d_really_is_positive(path.dentry))
+ 		fsnotify_inode(d_inode(path.dentry), mask);
