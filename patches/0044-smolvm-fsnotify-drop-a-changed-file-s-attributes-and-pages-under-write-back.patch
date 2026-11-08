@@ -12,7 +12,15 @@ Signed-off-by: smolvm <noreply@smolvm>
 diff --git a/fs/notify/smolvm_inject.c b/fs/notify/smolvm_inject.c
 --- a/fs/notify/smolvm_inject.c
 +++ b/fs/notify/smolvm_inject.c
-@@ -144,8 +144,23 @@
+@@ -32,6 +32,7 @@
+ #include <linux/magic.h>
+ #include <linux/slab.h>
+ #include <linux/limits.h>
++#include <linux/pagemap.h>
+ #if IS_ENABLED(CONFIG_FUSE_FS)
+ #include "../fuse/fuse_i.h"
+ #endif
+@@ -144,8 +145,26 @@
  		take_dentry_name_snapshot(&name, path.dentry);
  	}
  #if IS_ENABLED(CONFIG_FUSE_FS)
@@ -23,15 +31,18 @@ diff --git a/fs/notify/smolvm_inject.c b/fs/notify/smolvm_inject.c
 +		 * With a write-back cache the kernel trusts its own size, mtime
 +		 * and pages for a regular file and ignores what the server
 +		 * reports, so a host change would stay invisible: drop the
-+		 * attributes and the clean pages here. Dirty pages (the guest is
-+		 * writing the same file) are left alone; the guest's write wins.
++		 * attributes and the clean pages here. Pages the guest has
++		 * dirtied stay (invalidate_inode_pages2 leaves them and
++		 * reports -EBUSY); the guest's write wins, as before.
 +		 */
 +		if (d_really_is_positive(path.dentry) &&
 +		    S_ISREG(d_inode(path.dentry)->i_mode)) {
 +			struct inode *inode = d_inode(path.dentry);
 +
 +			fuse_invalidate_attr(inode);
-+			invalidate_inode_pages2(inode->i_mapping);
++			if (invalidate_inode_pages2(inode->i_mapping) == -EBUSY)
++				pr_debug("smolvm-fsnotify: %s has dirty pages, kept\n",
++					 pathstr);
 +		}
 +	}
  #endif
