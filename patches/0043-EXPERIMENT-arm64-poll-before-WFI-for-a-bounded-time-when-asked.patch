@@ -1,11 +1,11 @@
-EXPERIMENT: arm64 idle spins for up to /proc/smolvm-idle-poll-us before WFI
+EXPERIMENT: arm64 idle polls adaptively (haltpoll-style) before WFI, ceiling /proc/smolvm-idle-poll-us
 
 Signed-off-by: smolvm <noreply@smolvm>
 ---
 diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
 --- a/arch/arm64/kernel/idle.c
 +++ b/arch/arm64/kernel/idle.c
-@@ -5,6 +5,11 @@
+@@ -5,6 +5,13 @@
  
  #include <linux/cpu.h>
  #include <linux/irqflags.h>
@@ -14,20 +14,27 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
 +#include <linux/sched.h>
 +#include <linux/sched/clock.h>
 +#include <linux/kstrtox.h>
++#include <linux/percpu.h>
++#include <linux/minmax.h>
  
  #include <asm/barrier.h>
  #include <asm/cpuidle.h>
-@@ -33,10 +38,61 @@
+@@ -33,10 +40,81 @@
  }
  
  /*
-+ * smolvm EXPERIMENT: before sleeping in WFI, spin for up to
-+ * /proc/smolvm-idle-poll-us microseconds with interrupts enabled, so a
-+ * completion that arrives right after the CPU went idle (the common case for
-+ * a thread waiting on a virtiofs reply) is taken without the wake-from-WFI
-+ * cost. Zero (the default) is the unchanged behaviour.
++ * smolvm EXPERIMENT: adaptive poll before WFI. A CPU that goes idle spins
++ * with interrupts enabled for a short, per-CPU window before sleeping in WFI,
++ * so a wake that arrives right away (a thread waiting on a virtiofs reply)
++ * costs no wake-from-WFI. The window adapts as cpuidle-haltpoll does: it
++ * grows when a wake arrived during the poll and shrinks when the poll ran out
++ * unused, so a CPU that idles for long stretches soon spends almost nothing.
++ * /proc/smolvm-idle-poll-us sets the ceiling; 0 (the default) disables it.
 + */
-+static u64 smolvm_idle_poll_ns;
++static u64 smolvm_idle_poll_max_ns;
++static DEFINE_PER_CPU(u64, smolvm_idle_poll_ns);
++
++#define SMOLVM_IDLE_POLL_MIN_NS	2000ULL
 +
 +static ssize_t smolvm_idle_poll_write(struct file *file, const char __user *ubuf,
 +				      size_t count, loff_t *ppos)
@@ -42,7 +49,7 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
 +	buf[count] = '\0';
 +	if (kstrtoul(buf, 10, &us) || us > 10000)
 +		return -EINVAL;
-+	WRITE_ONCE(smolvm_idle_poll_ns, (u64)us * 1000);
++	WRITE_ONCE(smolvm_idle_poll_max_ns, (u64)us * 1000);
 +	return count;
 +}
 +
@@ -63,17 +70,32 @@ diff --git a/arch/arm64/kernel/idle.c b/arch/arm64/kernel/idle.c
   */
  void __cpuidle arch_cpu_idle(void)
  {
-+	u64 poll_ns = READ_ONCE(smolvm_idle_poll_ns);
++	u64 max_ns = READ_ONCE(smolvm_idle_poll_max_ns);
 +
-+	if (poll_ns) {
-+		u64 deadline = local_clock() + poll_ns;
++	if (max_ns) {
++		u64 *window = this_cpu_ptr(&smolvm_idle_poll_ns);
++		u64 ns = *window;
++		u64 start, deadline;
++
++		if (ns < SMOLVM_IDLE_POLL_MIN_NS)
++			ns = SMOLVM_IDLE_POLL_MIN_NS;
++		if (ns > max_ns)
++			ns = max_ns;
++		start = local_clock();
++		deadline = start + ns;
 +
 +		raw_local_irq_enable();
 +		while (!need_resched() && local_clock() < deadline)
 +			cpu_relax();
 +		raw_local_irq_disable();
-+		if (need_resched())
++
++		if (need_resched()) {
++			/* A wake came during the poll: worth polling longer next time. */
++			*window = min(ns * 2, max_ns);
 +			return;
++		}
++		/* Nothing came: poll less next time. */
++		*window = ns / 2;
 +	}
 +
  	/*
