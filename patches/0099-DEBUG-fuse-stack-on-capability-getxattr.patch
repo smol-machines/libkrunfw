@@ -1,0 +1,21 @@
+DEBUG ONLY (not for commit): sampled stacks for capability xattr reads over FUSE
+---
+diff --git a/fs/fuse/xattr.c b/fs/fuse/xattr.c
+--- a/fs/fuse/xattr.c
++++ b/fs/fuse/xattr.c
+@@ -60,6 +60,15 @@
+ 	if (fm->fc->no_getxattr)
+ 		return -EOPNOTSUPP;
+ 
++	/* smolvm DEBUG: who asks for the capability xattr? One stack early, then one every 5000th call. */
++	if (!strcmp(name, "security.capability")) {
++		static atomic_t smolvm_cap_reads = ATOMIC_INIT(0);
++		int n = atomic_inc_return(&smolvm_cap_reads);
++
++		if (n == 1 || n % 5000 == 0)
++			WARN(1, "smolvm debug: getxattr security.capability #%d\n", n);
++	}
++
+ 	memset(&inarg, 0, sizeof(inarg));
+ 	inarg.size = size;
+ 	args.opcode = FUSE_GETXATTR;
