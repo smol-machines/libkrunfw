@@ -1,0 +1,38 @@
+fuse: skip the capability lookup before a write when the server kills privileges
+
+Before the first write to a regular file, file_remove_privs() asks whether the
+file carries security.capability, which on FUSE is a GETXATTR round trip to the
+server (on virtiofs here about 60 us, synchronous in the write path). The
+answer is never acted on when the server negotiated FUSE_HANDLE_KILLPRIV_V2:
+the kernel already marks every unprivileged write with FUSE_WRITE_KILL_SUIDGID
+and leaves killing suid, sgid and the capability to the server. The VFS caches
+a negative answer in S_NOSEC, so only the first write to each inode pays, but
+a tree of 34,500 small files written once pays 34,500 times (about 2 s of a
+31 s install).
+
+Mark a regular file's inode S_NOSEC as soon as it is created when the server
+handles privileges (inode_has_no_xattr() does so under SB_NOSEC, which such a
+connection sets, and only for a file without suid or sgid bits). The VFS still
+clears S_NOSEC when a chmod gives the file those bits, and a write to a file
+that gained them on the server's side is still stripped by the server.
+
+Signed-off-by: smolvm <noreply@smolvm>
+---
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -510,6 +510,14 @@ retry:
+ 			inode->i_flags |= S_NOCMTIME;
+ 		inode->i_generation = generation;
+ 		fuse_init_inode(inode, attr, fc);
++		/*
++		 * With FUSE_HANDLE_KILLPRIV_V2 the server strips suid, sgid
++		 * and security.capability on write itself, so the VFS need
++		 * not ask for the capability before the first write to the
++		 * file (a round trip per file on virtiofs).
++		 */
++		if (fc->handle_killpriv_v2 && S_ISREG(inode->i_mode))
++			inode_has_no_xattr(inode);
+ 		unlock_new_inode(inode);
+ 	} else if (fuse_stale_inode(inode, generation, attr)) {
+ 		/* nodeid was reused, any I/O on the old inode should fail */

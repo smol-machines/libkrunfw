@@ -1,0 +1,90 @@
+smolvm: fsnotify inject: drop a cached absence when the host creates the name
+
+When the virtiofs server lets the guest keep a missing name for a while (a
+negative dentry with an entry timeout), a file the host then creates under that
+name stays invisible to the guest until the timeout, and the injected event for
+it could not even find the path: kern_path() fails on the negative dentry and
+the write returned ENOENT without touching anything.
+
+Resolve the parent instead and look the name up in the dentry cache; a dentry
+found there is the cached absence, so drop it, and wake the parent's watchers
+with the event and the name, as a create does. The next lookup of the name goes
+to the server and finds the file.
+
+Signed-off-by: smolvm <noreply@smolvm>
+---
+diff --git a/fs/notify/smolvm_inject.c b/fs/notify/smolvm_inject.c
+--- a/fs/notify/smolvm_inject.c
++++ b/fs/notify/smolvm_inject.c
+@@ -26,6 +26,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/namei.h>
+ #include <linux/dcache.h>
++#include <linux/stringhash.h>
+ #include <linux/fsnotify.h>
+ #include <linux/fs.h>
+ #include <linux/magic.h>
+@@ -38,6 +39,50 @@
+ /* Bound a single request: an FS_* mask in hex plus one absolute path. */
+ #define SMOLVM_FSNOTIFY_MAX (PATH_MAX + 32)
+ 
++/*
++ * The path does not resolve: the guest may hold a cached absence (a negative
++ * dentry the server told it to keep) for a name the host has since created.
++ * Find it under the parent and drop it, then wake the parent's watchers as a
++ * create of that name would, so the next lookup asks the server.
++ */
++static int smolvm_fsnotify_absent(char *pathstr, u32 mask)
++{
++	struct path parent;
++	struct dentry *child;
++	struct qstr qname;
++	char *slash;
++	int ret;
++
++	slash = strrchr(pathstr, '/');
++	if (!slash || slash == pathstr || slash[1] == '\0')
++		return -ENOENT;
++	*slash = '\0';
++	ret = kern_path(pathstr, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &parent);
++	*slash = '/';
++	if (ret)
++		return ret;
++
++	qname.name = (const unsigned char *)(slash + 1);
++	qname.len = strlen(slash + 1);
++	qname.hash = full_name_hash(parent.dentry, qname.name, qname.len);
++	child = d_lookup(parent.dentry, &qname);
++	if (child) {
++		/*
++		 * A positive dentry here would have resolved above; this is the
++		 * cached absence. Dropping it makes the next lookup ask the
++		 * server, and the name event below lets a directory watcher
++		 * pick the new file up.
++		 */
++		d_invalidate(child);
++		fsnotify_name(mask, d_inode(parent.dentry), FSNOTIFY_EVENT_INODE,
++			      d_inode(parent.dentry), &qname, 0);
++		dput(child);
++	}
++	fsnotify_inode(d_inode(parent.dentry), FS_MODIFY);
++	path_put(&parent);
++	return 0;
++}
++
+ static ssize_t smolvm_fsnotify_write(struct file *file, const char __user *ubuf,
+ 				     size_t count, loff_t *ppos)
+ {
+@@ -79,6 +124,12 @@
+ 	}
+ 
+ 	ret = kern_path(pathstr, LOOKUP_FOLLOW, &path);
++	if (ret == -ENOENT) {
++		ret = smolvm_fsnotify_absent(pathstr, mask);
++		if (!ret)
++			ret = count;
++		goto out;
++	}
+ 	if (ret)
+ 		goto out;
+ 
