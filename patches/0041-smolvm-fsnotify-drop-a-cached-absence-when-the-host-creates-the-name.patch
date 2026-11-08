@@ -43,7 +43,7 @@ diff --git a/fs/notify/smolvm_inject.c b/fs/notify/smolvm_inject.c
 +	if (ret)
 +		return ret;
 +
-+	qname.name = slash + 1;
++	qname.name = (const unsigned char *)(slash + 1);
 +	qname.len = strlen(slash + 1);
 +	child = d_hash_and_lookup(parent.dentry, &qname);
 +	if (IS_ERR(child))
