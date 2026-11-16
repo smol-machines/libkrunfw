@@ -17,7 +17,11 @@ set -u
 # The Windows config is maintained by hand and has no build job in CI, so it is
 # the one most likely to drift: it silently lacked the entire netfilter menu
 # while the other two carried it, which is the only reason this list covers it.
-CONFIGS='config-libkrunfw_x86_64 config-libkrunfw_aarch64 config-libkrunfw-windows_x86_64'
+# Build jobs also pass the resolved .config, so unmet dependencies cannot make
+# a source-config assertion pass while silently removing the feature at build.
+if [ "$#" -eq 0 ]; then
+	set -- config-libkrunfw_x86_64 config-libkrunfw_aarch64 config-libkrunfw-windows_x86_64
+fi
 
 # "EXACT_CONFIG_LINE|why it is required" — one per line.
 #
@@ -29,6 +33,15 @@ CONFIG_DRM_VIRTIO_GPU=y|virtio-GPU driver; provides card0/renderD128 for --gpu
 CONFIG_NETFILTER=y|netfilter core; gates the whole menu, so its absence drops every option below
 CONFIG_NF_TABLES=y|nftables; the backend iptables-nft and kube-proxy write rules through
 CONFIG_NETFILTER_XTABLES=y|xtables match/target infrastructure used by iptables-legacy
+CONFIG_NETFILTER_ADVANCED=y|advanced netfilter matches; gates the ipset match below
+CONFIG_NETFILTER_NETLINK=y|netfilter netlink; ipset userspace configures sets through it
+CONFIG_IP_SET=y|ipset core; K3s skips network-policy enforcement without it
+CONFIG_IP_SET_HASH_IP=y|hash:ip sets; network policies select pod addresses with them
+CONFIG_IP_SET_HASH_NET=y|hash:net sets; network policies match ipBlock CIDRs with them
+CONFIG_NETFILTER_XT_SET=y|iptables set match; enforces the policy address sets
+CONFIG_BRIDGE=y|Linux bridges; connects pods through the CNI bridge
+CONFIG_BRIDGE_NETFILTER=y|bridge netfilter hooks; required by bridged policy matches
+CONFIG_NETFILTER_XT_MATCH_PHYSDEV=y|bridged pod traffic matching used by network policies
 CONFIG_IP_NF_IPTABLES=y|iptables IPv4 tables
 CONFIG_IP6_NF_IPTABLES=y|iptables IPv6 tables
 CONFIG_NF_CONNTRACK=y|connection tracking; NAT and stateful matches depend on it
@@ -44,7 +57,7 @@ CONFIG_DMABUF_HEAPS_SYSTEM=y|system DMA-BUF heap (/dev/dma_heap/system); Android
 CONFIG_PSI=y|pressure stall information (/proc/pressure); Android lmkd and systemd-oomd read memory pressure from it'
 
 fail=0
-for cfg in $CONFIGS; do
+for cfg in "$@"; do
 	if [ ! -f "$cfg" ]; then
 		echo "  FAIL  $cfg: file not found"
 		fail=1
