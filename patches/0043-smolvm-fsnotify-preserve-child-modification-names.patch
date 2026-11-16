@@ -1,0 +1,38 @@
+smolvm: preserve child names for injected modification events
+
+Route inode events through fsnotify_dentry() and keep directory-entry events
+separate so directory watchers receive the modified child name and file
+watchers do not receive synthetic creates when masks are combined.
+
+---
+--- a/fs/notify/smolvm_inject.c
++++ b/fs/notify/smolvm_inject.c
+@@ -147,12 +147,23 @@
+ 	if (path.dentry->d_sb->s_magic == FUSE_SUPER_MAGIC)
+ 		fuse_invalidate_entry_cache(path.dentry);
+ #endif
+-	if (d_really_is_positive(path.dentry))
+-		fsnotify_inode(d_inode(path.dentry), mask);
++	/*
++	 * An inode event must go through the child/parent path. Passing MODIFY
++	 * or ATTRIB to fsnotify_name() makes the directory the event's inode;
++	 * fsnotify then strips the filename before calling inotify. Directory
++	 * watchers consequently see a change to themselves, not to this child.
++	 * Keep dirent events separate, including when the host combines masks,
++	 * so file watches do not receive a bogus CREATE and parent watches keep
++	 * the child's name for both kinds of event.
++	 */
++	if (d_really_is_positive(path.dentry) &&
++	    (mask & ~ALL_FSNOTIFY_DIRENT_EVENTS & ALL_FSNOTIFY_EVENTS))
++		fsnotify_dentry(path.dentry, mask & ~ALL_FSNOTIFY_DIRENT_EVENTS);
+ 	if (parent) {
+-		fsnotify_name(mask, path.dentry, FSNOTIFY_EVENT_DENTRY,
+-			      d_inode(parent), &name.name, 0);
+-		fsnotify_inode(d_inode(parent), FS_MODIFY);
++		if (mask & ALL_FSNOTIFY_DIRENT_EVENTS)
++			fsnotify_name(mask & (ALL_FSNOTIFY_DIRENT_EVENTS | FS_ISDIR),
++				      path.dentry, FSNOTIFY_EVENT_DENTRY,
++				      d_inode(parent), &name.name, 0);
+ 		release_dentry_name_snapshot(&name);
+ 		dput(parent);
+ 	}
