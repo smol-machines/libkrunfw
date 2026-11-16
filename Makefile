@@ -28,6 +28,12 @@ ifeq ($(origin OS),command line)
 else
     OS := $(shell uname -s)
 endif
+
+# Keep the firmware wrapper loadable on every supported Apple Silicon host.
+# Otherwise clang inherits the build machine's current macOS version.
+ifeq ($(OS),Darwin)
+    export MACOSX_DEPLOYMENT_TARGET ?= 11.0
+endif
 ifeq ($(ARCH),)
 	GUESTARCH := $(HOSTARCH)
 	STRIP := strip
