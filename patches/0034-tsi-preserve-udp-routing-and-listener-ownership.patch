@@ -1,0 +1,189 @@
+From: SmolVM runtime maintenance
+Subject: [PATCH] tsi: preserve UDP routing, readiness and listener ownership
+
+Intent and validation: docs/tsi-udp-routing.md.
+
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -817,10 +817,26 @@
+ 		events = vsocket->ops->poll(file, vsocket, wait);
+ 		break;
+ 	default:
+-		if (vsocket)
+-			events |= vsocket->ops->poll(file, vsocket, wait);
+-		if (events)
+-			tsk->status = S_VSOCK;
++		if (sk->sk_type == SOCK_DGRAM) {
++			__poll_t inet_events = 0, vsock_events = 0;
++			const __poll_t readable = EPOLLIN | EPOLLRDNORM;
++
++			/* Writability does not choose a datagram destination.
++			 * Observe both queues; HYBRID recvmsg prefers INET.
++			 * Select the proxy only when it has the readable data. */
++			if (isocket)
++				inet_events = isocket->ops->poll(file, isocket, wait);
++			if (vsocket)
++				vsock_events = vsocket->ops->poll(file, vsocket, wait);
++			events = inet_events | vsock_events;
++			if ((vsock_events & readable) && !(inet_events & readable))
++				tsk->status = S_VSOCK;
++		} else {
++			if (vsocket)
++				events |= vsocket->ops->poll(file, vsocket, wait);
++			if (events)
++				tsk->status = S_VSOCK;
++		}
+ 	}
+ 
+ 	release_sock(sk);
+@@ -1227,6 +1243,8 @@
+ 	struct tsi_sock *tsk;
+ 	struct net *net;
+ 	struct sock *listener;
++	struct sock *inet_sk_source;
++	bool found;
+ 
+ 	tsk = tsi_sk(sk);
+ 
+@@ -1235,12 +1253,15 @@
+ 
+ 	if (!addr)
+ 		return false;
++	if (WARN_ON_ONCE(!tsk->isocket))
++		return false;
++	inet_sk_source = tsk->isocket->sk;
+ 
+ 	net = sock_net(sk);
+ 
+ 	if (tsk->family == PF_INET) {
+ 		struct sockaddr_in *sin;
+-		__be32 daddr;
++		__be32 daddr, saddr;
+ 		__be16 dport;
+ 
+ 		if (addr_len < sizeof(struct sockaddr_in))
+@@ -1253,18 +1274,47 @@
+ 		daddr = sin->sin_addr.s_addr;
+ 		dport = sin->sin_port;
+ 
++		saddr = inet_sk(inet_sk_source)->inet_saddr;
++		if (!saddr) {
++			struct flowi4 fl4;
++			struct rtable *rt;
++			int oif = READ_ONCE(inet_sk_source->sk_bound_dev_if);
++
++			if (!oif)
++				oif = READ_ONCE(inet_sk(inet_sk_source)->uc_index);
++			/* Match the source selected by the INET stack for a socket
++			 * bound to ANY; zero is not a wildcard for a connected peer.
++			 * The route helper retains socket mark/UID/security policy. */
++			rt = ip_route_output_ports(net, &fl4, inet_sk_source,
++						   daddr, saddr, dport,
++						   inet_sk(inet_sk_source)->inet_sport,
++						   inet_sk_source->sk_protocol,
++						   RT_TOS(inet_sk(inet_sk_source)->tos), oif);
++			if (IS_ERR(rt)) {
++				pr_warn_ratelimited("%s: wildcard source route failed: error=%ld destination=%pI4:%u interface=%d mark=%u\n",
++					 __func__, PTR_ERR(rt), &daddr, ntohs(dport),
++					 oif, READ_ONCE(inet_sk_source->sk_mark));
++				return false;
++			}
++			saddr = fl4.saddr;
++			ip_rt_put(rt);
++		}
++
+ 		/* Check if anyone is listening on that destination address:port */
++		rcu_read_lock();
+ 		listener = __udp4_lib_lookup(net,
+-					      0, 0,           /* source addr/port - don't care */
++					      saddr,
++					      inet_sk(inet_sk_source)->inet_sport,
+ 					      daddr, dport,   /* dest addr/port */
+ 					      0, 0,           /* device indices */
+ 					      net->ipv4.udp_table,
+ 					      NULL);
+ 
+-		if (listener) {
+-			sock_put(listener);  /* Release the reference */
+-			return true;
+-		}
++		/* Internal UDP lookup returns a borrowed RCU-protected socket.
++		 * We only need its existence; no reference was acquired. */
++		found = listener != NULL;
++		rcu_read_unlock();
++		return found;
+ 	} else if (tsk->family == PF_INET6) {
+ 		struct sockaddr_in6 *sin6;
+ 		const struct in6_addr *daddr;
+@@ -1281,17 +1331,20 @@
+ 		dport = sin6->sin6_port;
+ 
+ 		/* Check if anyone is listening on that destination address:port */
++		rcu_read_lock();
+ 		listener = __udp6_lib_lookup(net,
+-					      NULL, 0,        /* source addr/port - don't care */
++					      &inet_sk_source->sk_v6_rcv_saddr,
++					      inet_sk(inet_sk_source)->inet_sport,
+ 					      daddr, dport,   /* dest addr/port */
+ 					      0, 0,           /* device indices */
+ 					      net->ipv4.udp_table,
+ 					      NULL);
+ 
+-		if (listener) {
+-			sock_put(listener);  /* Release the reference */
+-			return true;
+-		}
++		/* Internal UDP lookup returns a borrowed RCU-protected socket.
++		 * We only need its existence; no reference was acquired. */
++		found = listener != NULL;
++		rcu_read_unlock();
++		return found;
+ 	}
+ 
+ 	return false;
+@@ -1321,12 +1374,15 @@
+ 	 * A hybrid connected datagram socket sends with no msg_name; supply the
+ 	 * peer recorded at connect() time (on a private copy, since the vsock
+ 	 * proxy path rewrites msg_name in place) so the per-destination routing
+-	 * below has a target. Only for S_HYBRID: an S_VSOCK socket already has
+-	 * a connected proxy flow, and naming a peer here re-routes its sends
+-	 * through the sendto flow, whose replies never reach the socket — the
+-	 * agent's own resolver then times out and image pulls fail at boot.
++	 * below has a target. Continue supplying that peer after a hybrid send
++	 * changes status to S_VSOCK: this sendto-backed proxy never connected
++	 * its underlying vsock. A genuinely connected vsock must keep its
++	 * original flow and must not be redirected through the sendto path.
+ 	 */
+-	if (tsk->status == S_HYBRID && !msg->msg_name && tsk->sendto_addr) {
++	if (!msg->msg_name && tsk->sendto_addr &&
++	    (tsk->status == S_HYBRID ||
++	     (tsk->status == S_VSOCK && sock->state == SS_CONNECTED &&
++	      vsocket->state != SS_CONNECTED))) {
+ 		memcpy(&connected_peer, tsk->sendto_addr, tsk->sendto_addr_len);
+ 		msg->msg_name = &connected_peer;
+ 		msg->msg_namelen = tsk->sendto_addr_len;
+@@ -1338,6 +1394,24 @@
+ 		break;
+ 	case S_HYBRID: {
+ 		bool has_local_listener;
++
++		/* A private namespace's loopback belongs to its INET stack.
++		 * In particular, OUTPUT DNAT can redirect a port with no bound
++		 * listener (Docker DNS :53) to its actual local listener. The
++		 * pre-NAT listener lookup below cannot observe that mapping.
++		 * Preserve local errors; never leak private loopback to the host.
++		 */
++		if (sock_net(sk) != &init_net && tsk->family == PF_INET &&
++		    msg->msg_name &&
++		    msg->msg_namelen == (int)sizeof(struct sockaddr_in)) {
++			struct sockaddr_in *sin = msg->msg_name;
++
++			if (sin->sin_family == AF_INET &&
++			    ipv4_is_loopback(sin->sin_addr.s_addr)) {
++				err = isocket->ops->sendmsg(isocket, msg, len);
++				goto release;
++			}
++		}
+ 
+ 		/*
+ 		 * For datagram sockets, we need to decide whether to send via
