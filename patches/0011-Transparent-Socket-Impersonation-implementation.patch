@@ -115,7 +115,7 @@ new file mode 100644
 index 000000000..608a68265
 --- /dev/null
 +++ b/net/tsi/af_tsi.c
-@@ -0,0 +1,1774 @@
+@@ -0,0 +1,1819 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +/*
 + * Transparent Socket Impersonation Driver
@@ -950,6 +950,26 @@ index 000000000..608a68265
 +		events = vsocket->ops->poll(file, vsocket, wait);
 +		break;
 +	default:
++		/*
++		 * A hybrid datagram socket receives on its inet socket: a guest
++		 * process reaches it through the guest's own stack (see
++		 * tsi_dgram_sendmsg), and recvmsg reads the inet socket in this
++		 * state. Poll both sockets so both wait queues are registered,
++		 * and do not latch to vsock here: a datagram vsock socket is
++		 * writable at once, so the first poll moved every bound UDP
++		 * server to S_VSOCK, where neither poll nor recvmsg sees the
++		 * inet socket again, and a guest UDP server driven by poll,
++		 * select or epoll never received a datagram from the same
++		 * guest. A datagram socket latches to vsock when it first sends
++		 * through the proxy (tsi_dgram_sendmsg).
++		 */
++		if (sk->sk_type == SOCK_DGRAM) {
++			if (isocket)
++				events |= isocket->ops->poll(file, isocket, wait);
++			if (vsocket)
++				events |= vsocket->ops->poll(file, vsocket, wait);
++			break;
++		}
 +		if (vsocket)
 +			events |= vsocket->ops->poll(file, vsocket, wait);
 +		if (events)
@@ -1360,6 +1380,7 @@ index 000000000..608a68265
 +	struct tsi_sock *tsk;
 +	struct net *net;
 +	struct sock *listener;
++	struct sock *isk;
 +	bool found;
 +
 +	tsk = tsi_sk(sk);
@@ -1372,8 +1393,22 @@ index 000000000..608a68265
 +
 +	net = sock_net(sk);
 +
++	/*
++	 * Look the receiver up as the datagram will reach it: from this
++	 * socket's own address and port. A connected receiver (a client that
++	 * called connect(), as resolvers and most UDP clients do) matches only
++	 * a sender with its peer's address and port, so a lookup from 0:0
++	 * never found it and the reply left through the vsock proxy for the
++	 * host. A sender with no address of its own yet sends to a local
++	 * address from that same address.
++	 */
++	isk = tsk->isocket ? tsk->isocket->sk : NULL;
++	if (!isk)
++		return false;
++
 +	if (tsk->family == PF_INET) {
 +		struct sockaddr_in *sin;
++		__be32 saddr;
 +		__be32 daddr;
 +		__be16 dport;
 +
@@ -1386,11 +1421,13 @@ index 000000000..608a68265
 +
 +		daddr = sin->sin_addr.s_addr;
 +		dport = sin->sin_port;
++		saddr = inet_sk(isk)->inet_saddr ? inet_sk(isk)->inet_saddr :
++						   daddr;
 +
 +		/* Check if anyone is listening on that destination address:port */
 +		rcu_read_lock();
 +		listener = __udp4_lib_lookup(net,
-+					      0, 0,           /* source addr/port - don't care */
++					      saddr, inet_sk(isk)->inet_sport,
 +					      daddr, dport,   /* dest addr/port */
 +					      0, 0,           /* device indices */
 +					      net->ipv4.udp_table,
@@ -1409,6 +1446,7 @@ index 000000000..608a68265
 +			return true;
 +	} else if (tsk->family == PF_INET6) {
 +		struct sockaddr_in6 *sin6;
++		const struct in6_addr *saddr;
 +		const struct in6_addr *daddr;
 +		__be16 dport;
 +
@@ -1421,11 +1459,18 @@ index 000000000..608a68265
 +
 +		daddr = &sin6->sin6_addr;
 +		dport = sin6->sin6_port;
++		/*
++		 * Never NULL: the lookup hashes and compares the source address
++		 * (udp6_lib_lookup4, compute_score), so a NULL here oopses once
++		 * a connected socket shares the destination's hash slot.
++		 */
++		saddr = ipv6_addr_any(&isk->sk_v6_rcv_saddr) ?
++				daddr : &isk->sk_v6_rcv_saddr;
 +
 +		/* Check if anyone is listening on that destination address:port */
 +		rcu_read_lock();
 +		listener = __udp6_lib_lookup(net,
-+					      NULL, 0,        /* source addr/port - don't care */
++					      saddr, inet_sk(isk)->inet_sport,
 +					      daddr, dport,   /* dest addr/port */
 +					      0, 0,           /* device indices */
 +					      net->ipv4.udp_table,
