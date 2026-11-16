@@ -1,0 +1,35 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: preserve the port allocated by a stream bind
+
+Use the shadow socket address for the host listener so bind(0) and
+getsockname() refer to the same port before and after listen.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -253,9 +253,24 @@
+ 
+ 	if (!tsk->bound_addr) {
+ 		tsk->bound_addr = kmalloc(addr_len, GFP_KERNEL);
++		if (!tsk->bound_addr) {
++			err = -ENOMEM;
++			goto release;
++		}
+ 		tsk->bound_addr_len = addr_len;
+ 	}
+ 	memcpy(tsk->bound_addr, addr, addr_len);
++	if (sk->sk_type == SOCK_STREAM &&
++	    (tsk->family == AF_INET || tsk->family == AF_INET6)) {
++		/* Keep the port allocated by bind(0) when creating the host
++		 * listener; a second ephemeral allocation would disagree with
++		 * getsockname() on the shadow socket.
++		 */
++		err = isocket->ops->getname(isocket, tsk->bound_addr, 0);
++		if (err < 0)
++			goto release;
++	}
++	err = 0;
+ 
+ release:
+ 	release_sock(sk);

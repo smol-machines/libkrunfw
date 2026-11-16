@@ -1,0 +1,56 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: apply proxied stream options to the active transport
+
+Avoid dereferencing the absent inet socket of an accepted connection and
+make stream timeouts affect I/O while preserving getsockopt round trips.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -1237,7 +1237,7 @@
+ }
+ 
+ /*
+- * Mirror commonly-read SOL_SOCKET fields from the inner inet socket onto the
++ * Mirror commonly-read SOL_SOCKET fields from the active inner socket onto the
+  * outer TSI sock. This is required because the kernel's do_sock_getsockopt()
+  * unconditionally reads SOL_SOCKET options directly from sock->sk via
+  * sk_getsockopt() and never calls our ops->getsockopt for level==SOL_SOCKET.
+@@ -1275,6 +1275,14 @@
+ 		else
+ 			sock_reset_flag(sk, SOCK_LINGER);
+ 		sk->sk_lingertime = src->sk_lingertime;
++		break;
++	case SO_RCVTIMEO_OLD:
++	case SO_RCVTIMEO_NEW:
++		WRITE_ONCE(sk->sk_rcvtimeo, READ_ONCE(src->sk_rcvtimeo));
++		break;
++	case SO_SNDTIMEO_OLD:
++	case SO_SNDTIMEO_NEW:
++		WRITE_ONCE(sk->sk_sndtimeo, READ_ONCE(src->sk_sndtimeo));
+ 		break;
+ 	case SO_RCVBUF:
+ 	case SO_RCVBUFFORCE:
+@@ -1323,16 +1331,14 @@
+ 	case S_VSOCK:
+ 		if (level == SOL_SOCKET) {
+ 			/*
+-			 * The connection is now proxied via vsock, but
+-			 * callers can still query SOL_SOCKET options. Apply
+-			 * the option to isocket purely for kernel-side
+-			 * validation/canonicalization, then mirror onto the
+-			 * outer sock so getsockopt round-trips work.
++			 * Accepted proxy connections have no shadow inet socket.
++			 * Apply options to the active transport so timeouts govern
++			 * real I/O, then mirror fields queried on the outer socket.
+ 			 */
+-			err = sock_setsockopt(isocket, level, optname, optval,
++			err = sock_setsockopt(tsk->vsocket, level, optname, optval,
+ 					      optlen);
+ 			if (!err)
+-				tsi_mirror_sol_socket_field(sk, isocket->sk,
++				tsi_mirror_sol_socket_field(sk, tsk->vsocket->sk,
+ 							    optname);
+ 		} else {
+ 			// TODO implement remote setsockopt
