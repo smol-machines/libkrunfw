@@ -1,0 +1,21 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: release the control socket and saved addresses on close
+
+Release the per-socket control channel and saved bind/peer addresses before
+dropping the final TSI socket reference.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -185,6 +185,10 @@
+ 	sk->sk_shutdown = SHUTDOWN_MASK;
+ 	skb_queue_purge(&sk->sk_receive_queue);
+ 	release_sock(sk);
++	if (tsk->csocket)
++		sock_release(tsk->csocket);
++	kfree(tsk->bound_addr);
++	kfree(tsk->sendto_addr);
+ 	sock_put(sk);
+ 	sock->sk = NULL;
+ 	sock->state = SS_FREE;
