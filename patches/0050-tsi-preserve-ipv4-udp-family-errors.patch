@@ -1,0 +1,22 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: report Linux IPv4 UDP family errors
+
+Reject unsupported IPv4 UDP destination families with EAFNOSUPPORT
+without changing the existing peer, matching native Linux behavior.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -677,6 +677,11 @@
+ 			"%s: rejecting mismatched family addr->sa_family=%d tsk->family=%d\n",
+ 			__func__, addr->sa_family, tsk->family);
+ 		err = -EINVAL;
++		/* Match the IPv4 UDP stack without changing the current peer. */
++		if (tsi_host_enabled(tsk) && sk->sk_type == SOCK_DGRAM &&
++		    tsk->family == AF_INET && addr->sa_family != AF_UNSPEC &&
++		    addr_len >= sizeof(struct sockaddr_in))
++			err = -EAFNOSUPPORT;
+ 		goto release;
+ 	}
+ 

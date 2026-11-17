@@ -1,0 +1,223 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: coordinate Linux socket buffer budgets with the host
+
+Validate buffer requests before updating host transports, then commit guest
+queue state and independent stream windows after a successful response.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -46,7 +46,7 @@
+ };
+ 
+ /* Selected by the VMM only with a matching host socket transport. */
+-static const char tsi_host_network_abi[] __used = "KRUN_TSI_HOST_NETWORK_ABI_5";
++static const char tsi_host_network_abi[] __used = "KRUN_TSI_HOST_NETWORK_ABI_6";
+ static bool tsi_host_network;
+ core_param(tsi_host_network, tsi_host_network, bool, 0);
+ 
+@@ -1807,6 +1807,7 @@
+ 	if (err)
+ 		return err;
+ 	dst = child->isocket->sk;
++	dst->sk_userlocks = src->sk_userlocks;
+ 	for (i = 0; i < ARRAY_SIZE(options); i++) {
+ 		tsi_mirror_sol_socket_field(dst, src, options[i]);
+ 		tsi_mirror_sol_socket_field(sk_tsi(child), src, options[i]);
+@@ -1821,22 +1822,87 @@
+ 	return 0;
+ }
+ 
++/* Use Linux's validation, privilege checks and buffer canonicalization on
++ * the private inet socket, then restore its state until the host accepts it.
++ * The outer socket lock serializes every access to this private option state.
++ */
++static int tsi_host_buffer_value(struct tsi_sock *tsk, int optname, int value,
++				 int *capacity)
++{
++	struct sock *sk = tsk->isocket->sk;
++	bool receive = optname == SO_RCVBUF || optname == SO_RCVBUFFORCE;
++	int previous = receive ? READ_ONCE(sk->sk_rcvbuf) : READ_ONCE(sk->sk_sndbuf);
++	unsigned int locks = sk->sk_userlocks;
++	int err;
++
++	err = sock_setsockopt(tsk->isocket, SOL_SOCKET, optname,
++			      KERNEL_SOCKPTR(&value), sizeof(value));
++	if (err)
++		return err;
++	*capacity = receive ? READ_ONCE(sk->sk_rcvbuf) : READ_ONCE(sk->sk_sndbuf);
++	if (receive)
++		WRITE_ONCE(sk->sk_rcvbuf, previous);
++	else
++		WRITE_ONCE(sk->sk_sndbuf, previous);
++	sk->sk_userlocks = locks;
++	return 0;
++}
++
++static void tsi_host_buffer_commit(struct tsi_sock *tsk, int optname, int capacity)
++{
++	struct sock *sk = tsk->isocket->sk;
++	struct sock *vsk = tsk->vsocket->sk;
++	struct vsock_sock *vs = vsock_sk(vsk);
++	bool receive = optname == SO_RCVBUF || optname == SO_RCVBUFFORCE;
++
++	if (receive) {
++		WRITE_ONCE(sk->sk_rcvbuf, capacity);
++		sk->sk_userlocks |= SOCK_RCVBUF_LOCK;
++	} else {
++		WRITE_ONCE(sk->sk_sndbuf, capacity);
++		sk->sk_userlocks |= SOCK_SNDBUF_LOCK;
++	}
++	tsi_mirror_sol_socket_field(sk_tsi(tsk), sk, optname);
++	lock_sock(vsk);
++	tsi_mirror_sol_socket_field(vsk, sk, optname);
++	if (receive) {
++		vsk->sk_userlocks |= SOCK_RCVBUF_LOCK;
++		if (sk_tsi(tsk)->sk_type == SOCK_STREAM) {
++			const struct vsock_transport *transport = vs->transport;
++			u64 size = capacity;
++
++			if (transport && transport->notify_buffer_size)
++				transport->notify_buffer_size(vs, &size);
++			vs->buffer_size = size;
++		}
++	} else {
++		vsk->sk_userlocks |= SOCK_SNDBUF_LOCK;
++		WRITE_ONCE(vs->tsi_send_capacity, capacity);
++		vsk->sk_write_space(vsk);
++	}
++	release_sock(vsk);
++}
++
+ /* The supported integer options are validated before changing either side.
+- * Return one for guest-only options, zero on remote success, or an errno.
++ * Return two for committed buffers, one for guest-only options, zero for
++ * other remote options needing a guest commit, or a negative errno.
+  */
+ static int tsi_host_setsockopt(struct tsi_sock *tsk, int level, int optname,
+ 			       sockptr_t optval, unsigned int optlen, int *applied)
+ {
+ 	struct tsi_host_sockopt_req req;
+ 	struct tsi_getname_rsp rsp = { 0 };
+-	int value, wire_value, err;
+-	bool supported;
++	int value, wire_value, wire_option = optname, err;
++	bool supported, buffer;
+ 
+ 	if (!tsi_host_enabled(tsk))
+ 		return 1;
+ 	if (level == IPPROTO_IPV6 && optname == IPV6_V6ONLY && tsk->bound_addr)
+ 		return -EINVAL;
+-	supported = (level == SOL_SOCKET &&
++	buffer = level == SOL_SOCKET &&
++		 (optname == SO_SNDBUF || optname == SO_RCVBUF ||
++		  optname == SO_SNDBUFFORCE || optname == SO_RCVBUFFORCE);
++	supported = buffer || (level == SOL_SOCKET &&
+ 		     (optname == SO_REUSEADDR || optname == SO_REUSEPORT ||
+ 		      optname == SO_BROADCAST || optname == SO_KEEPALIVE)) ||
+ 		    (level == IPPROTO_TCP &&
+@@ -1875,6 +1941,13 @@
+ 	}
+ 	*applied = value;
+ 	wire_value = value;
++	if (buffer) {
++		err = tsi_host_buffer_value(tsk, optname, value, &wire_value);
++		if (err)
++			return err;
++		wire_option = (optname == SO_RCVBUF || optname == SO_RCVBUFFORCE) ?
++			      SO_RCVBUF : SO_SNDBUF;
++	}
+ 	if (level == IPPROTO_IP) {
+ 		if (value < -1 || value == 0 || value > 255)
+ 			return -EINVAL;
+@@ -1894,7 +1967,7 @@
+ 	req.svm_port = cpu_to_le32(tsk->svm_port);
+ 	req.svm_peer_port = cpu_to_le32(tsk->svm_peer_port);
+ 	req.level = cpu_to_le32(level);
+-	req.option = cpu_to_le32(optname);
++	req.option = cpu_to_le32(wire_option);
+ 	req.value = cpu_to_le32(wire_value);
+ 	err = tsi_control_sendmsg(tsk->csocket, TSI_HOST_SETSOCKOPT,
+ 				  &req, sizeof(req));
+@@ -1908,7 +1981,12 @@
+ 		return err;
+ 	if (err != sizeof(rsp))
+ 		return -EPROTO;
+-	return le32_to_cpu(rsp.result);
++	err = le32_to_cpu(rsp.result);
++	if (!err && buffer) {
++		tsi_host_buffer_commit(tsk, optname, wire_value);
++		return 2;
++	}
++	return err;
+ }
+ 
+ static int tsi_stream_setsockopt(struct socket *sock, int level, int optname,
+@@ -1927,6 +2005,10 @@
+ 		 tsk->status, tsk->family);
+ 
+ 	err = tsi_host_setsockopt(tsk, level, optname, optval, optlen, &applied);
++	if (err == 2) {
++		release_sock(sk);
++		return 0;
++	}
+ 	if (err < 0) {
+ 		release_sock(sk);
+ 		return err;
+@@ -2003,6 +2085,10 @@
+ 	 * mirrored onto the outer TSI sock.
+ 	 */
+ 	err = tsi_host_setsockopt(tsk, level, optname, optval, optlen, &applied);
++	if (err == 2) {
++		release_sock(sk);
++		return 0;
++	}
+ 	if (err < 0) {
+ 		release_sock(sk);
+ 		return err;
+@@ -2864,6 +2950,8 @@
+ 	tsk->sendto_addr = NULL;
+ 	tsk->bound_addr = NULL;
+ 	tsk->family = family;
++	if (sock->type == SOCK_STREAM && tsi_host_enabled(tsk))
++		vsock_sk(vsocket->sk)->tsi_send_capacity = vsock_sk(vsocket->sk)->buffer_size;
+ 	if (sock->type == SOCK_DGRAM && tsi_host_enabled(tsk)) {
+ 		write_lock_bh(&vsocket->sk->sk_callback_lock);
+ 		rcu_assign_sk_user_data(vsocket->sk, sk);
+--- a/include/net/af_vsock.h
++++ b/include/net/af_vsock.h
+@@ -40,6 +40,8 @@
+ 	bool trusted;
+ 	/* Private TSI sockets accept host-originated datagram error controls. */
+ 	bool tsi_host_errors;
++	/* Independent transmit budget for a host-network TSI stream. */
++	u32 tsi_send_capacity;
+ 	bool cached_peer_allow_dgram;	/* Dgram communication allowed to
+ 					 * cached peer?
+ 					 */
+--- a/net/vmw_vsock/af_vsock.c
++++ b/net/vmw_vsock/af_vsock.c
+@@ -932,6 +932,7 @@
+ 		vsk->owner = get_cred(psk->owner);
+ 		vsk->connect_timeout = psk->connect_timeout;
+ 		vsk->buffer_size = psk->buffer_size;
++		vsk->tsi_send_capacity = psk->tsi_send_capacity;
+ 		vsk->buffer_min_size = psk->buffer_min_size;
+ 		vsk->buffer_max_size = psk->buffer_max_size;
+ 		security_sk_clone(parent, sk);
+--- a/net/vmw_vsock/virtio_transport_common.c
++++ b/net/vmw_vsock/virtio_transport_common.c
+@@ -964,7 +964,11 @@
+ 	 * cap it to our local buf_alloc so a remote peer cannot force us to
+ 	 * queue more data than our own buffer configuration allows.
+ 	 */
+-	return min(vvs->peer_buf_alloc, vvs->buf_alloc);
++	u32 local = READ_ONCE(vvs->vsk->tsi_send_capacity);
++
++	if (!local)
++		local = vvs->buf_alloc;
++	return min(vvs->peer_buf_alloc, local);
+ }
+ 
+ int

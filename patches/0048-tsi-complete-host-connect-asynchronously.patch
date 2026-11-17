@@ -1,0 +1,479 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: complete host TCP connects asynchronously
+
+Use transport readiness and short work items to complete host TCP dials
+without blocking application event loops.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -11,6 +11,8 @@
+ #include <linux/types.h>
+ #include <linux/moduleparam.h>
+ #include <linux/poll.h>
++#include <linux/workqueue.h>
++#include <net/tcp_states.h>
+ #include <net/sock.h>
+ #include <net/af_unix.h>
+ #include <net/af_vsock.h>
+@@ -141,6 +143,232 @@
+ 	return tsi_control_sendrecv_msg(csocket, port, data, data_len, 1);
+ }
+ 
++/* The socket lock protects phases; transport waiters only queue short work. */
++static bool tsi_host_connect_pending(struct tsi_sock *tsk)
++{
++	return tsk->host_connect_phase == TSI_CONNECT_HOST ||
++	       tsk->host_connect_phase == TSI_CONNECT_VSOCK;
++}
++
++static int tsi_host_connect_wake(struct wait_queue_entry *entry,
++				 unsigned int mode, int sync, void *key)
++{
++	struct tsi_sock *tsk = entry->private;
++
++	schedule_work(&tsk->host_connect_work);
++	return 0;
++}
++
++static void tsi_host_connect_unwatch(struct tsi_sock *tsk)
++{
++	if (!tsk->host_connect_watched)
++		return;
++	remove_wait_queue(sk_sleep(tsk->host_connect_socket->sk),
++			  &tsk->host_connect_control_wait);
++	remove_wait_queue(sk_sleep(tsk->vsocket->sk),
++			  &tsk->host_connect_vsock_wait);
++	tsk->host_connect_watched = false;
++}
++
++static void tsi_host_connect_finish(struct tsi_sock *tsk, int err)
++{
++	struct sock *sk = sk_tsi(tsk);
++
++	tsi_host_connect_unwatch(tsk);
++	if (err) {
++		tsk->host_connect_phase = TSI_CONNECT_FAILED;
++		WRITE_ONCE(sk->sk_err, -err);
++		WRITE_ONCE(sk->sk_state, TCP_CLOSE);
++	} else {
++		tsk->host_connect_phase = TSI_CONNECT_DONE;
++		tsk->status = S_VSOCK;
++		WRITE_ONCE(sk->sk_state, TCP_ESTABLISHED);
++	}
++	sk->sk_state_change(sk);
++}
++
++static void tsi_host_connect_work(struct work_struct *work)
++{
++	struct tsi_sock *tsk = container_of(work, struct tsi_sock,
++					   host_connect_work);
++	struct sock *sk = sk_tsi(tsk);
++	struct tsi_connect_rsp rsp;
++	struct sockaddr_vm source = { 0 };
++	struct msghdr msg = { .msg_name = &source,
++			      .msg_namelen = sizeof(source) };
++	struct kvec iov = { .iov_base = &rsp, .iov_len = sizeof(rsp) };
++	struct sockaddr_vm addr = { .svm_family = AF_VSOCK,
++		.svm_cid = VMADDR_CID_HOST, .svm_port = TSI_DEFAULT_PORT };
++	int err;
++
++	lock_sock(sk);
++	if (tsk->host_connect_phase == TSI_CONNECT_HOST) {
++		err = kernel_recvmsg(tsk->host_connect_socket, &msg, &iov,
++				     1, sizeof(rsp), MSG_DONTWAIT);
++		if (err == -EAGAIN)
++			goto out;
++		if (err != sizeof(rsp) || source.svm_cid != VMADDR_CID_HOST ||
++		    source.svm_port != TSI_CONNECT) {
++			tsi_host_connect_finish(tsk, err < 0 ? err : -EPROTO);
++			goto out;
++		}
++		if (rsp.result) {
++			tsi_host_connect_finish(tsk,
++						rsp.result < 0 ? rsp.result : -EPROTO);
++			goto out;
++		}
++		tsk->host_connect_phase = TSI_CONNECT_VSOCK;
++		err = kernel_connect(tsk->vsocket, (struct sockaddr *)&addr,
++				     sizeof(addr), O_NONBLOCK);
++		if (!err) {
++			tsi_host_connect_finish(tsk, 0);
++			goto out;
++		}
++		if (err != -EINPROGRESS && err != -EALREADY) {
++			tsi_host_connect_finish(tsk, err);
++			goto out;
++		}
++	}
++	if (tsk->host_connect_phase == TSI_CONNECT_VSOCK) {
++		/* Completion may have raced the nonblocking kernel_connect. */
++		err = sock_error(tsk->vsocket->sk);
++		if (err)
++			tsi_host_connect_finish(tsk, err);
++		else if (READ_ONCE(tsk->vsocket->sk->sk_state) == TCP_ESTABLISHED)
++			tsi_host_connect_finish(tsk, 0);
++		else if (READ_ONCE(tsk->vsocket->sk->sk_state) == TCP_CLOSE)
++			tsi_host_connect_finish(tsk, -ECONNABORTED);
++	}
++out:
++	release_sock(sk);
++}
++
++/* Detach producers before joining work, without holding its socket lock. */
++static void tsi_host_connect_cancel(struct tsi_sock *tsk)
++{
++	struct sock *sk = sk_tsi(tsk);
++
++	if (!tsk->host_connect_socket)
++		return;
++	lock_sock(sk);
++	tsk->host_connect_phase = TSI_CONNECT_CLOSED;
++	tsi_host_connect_unwatch(tsk);
++	release_sock(sk);
++	cancel_work_sync(&tsk->host_connect_work);
++}
++
++/* Called with the outer socket locked; releases it while sleeping. */
++static long tsi_host_connect_wait(struct tsi_sock *tsk, long timeo)
++{
++	struct sock *sk = sk_tsi(tsk);
++	DEFINE_WAIT_FUNC(wait, woken_wake_function);
++
++	add_wait_queue(sk_sleep(sk), &wait);
++	while (tsi_host_connect_pending(tsk) && timeo &&
++	       !signal_pending(current)) {
++		release_sock(sk);
++		timeo = wait_woken(&wait, TASK_INTERRUPTIBLE, timeo);
++		lock_sock(sk);
++	}
++	remove_wait_queue(sk_sleep(sk), &wait);
++	return timeo;
++}
++
++static int tsi_create_proxy(struct tsi_sock *tsk, int type);
++
++static int tsi_host_connect_start(struct socket *sock, struct sockaddr *addr,
++				  int addr_len, int flags)
++{
++	struct sock *sk = sock->sk;
++	struct tsi_sock *tsk = tsi_sk(sk);
++	struct tsi_connect_req req = { 0 };
++	long timeo;
++	int err;
++
++	if (tsk->host_connect_phase == TSI_CONNECT_DONE) {
++		if (sock->state == SS_CONNECTED)
++			return -EISCONN;
++		sock->state = SS_CONNECTED;
++		return 0;
++	}
++	if (tsk->host_connect_phase == TSI_CONNECT_FAILED) {
++		err = sock_error(sk);
++		sock->state = SS_UNCONNECTED;
++		return err ? err : -ECONNABORTED;
++	}
++	if (tsi_host_connect_pending(tsk)) {
++		if (flags & O_NONBLOCK)
++			return -EALREADY;
++		goto wait;
++	}
++	if (tsk->status == S_VSOCK)
++		return -EISCONN;
++	if (!tsk->svm_port) {
++		err = tsi_create_proxy(tsk, SOCK_STREAM);
++		if (err)
++			return err;
++	}
++	err = tsi_create_control_socket(&tsk->host_connect_socket);
++	if (err) {
++		tsk->host_connect_socket = NULL;
++		return err;
++	}
++	INIT_WORK(&tsk->host_connect_work, tsi_host_connect_work);
++	init_waitqueue_func_entry(&tsk->host_connect_control_wait,
++				  tsi_host_connect_wake);
++	init_waitqueue_func_entry(&tsk->host_connect_vsock_wait,
++				  tsi_host_connect_wake);
++	tsk->host_connect_control_wait.private = tsk;
++	tsk->host_connect_vsock_wait.private = tsk;
++	add_wait_queue(sk_sleep(tsk->host_connect_socket->sk),
++		       &tsk->host_connect_control_wait);
++	add_wait_queue(sk_sleep(tsk->vsocket->sk),
++		       &tsk->host_connect_vsock_wait);
++	tsk->host_connect_watched = true;
++	tsk->host_connect_phase = TSI_CONNECT_HOST;
++	sock->state = SS_CONNECTING;
++	WRITE_ONCE(sk->sk_state, TCP_SYN_SENT);
++	req.svm_port = tsk->svm_port;
++	req.addr_len = addr_len;
++	memcpy(req.addr, addr, addr_len);
++	err = tsi_control_sendmsg(tsk->host_connect_socket, TSI_CONNECT,
++				  &req, sizeof(req));
++	if (err != sizeof(req)) {
++		tsi_host_connect_finish(tsk, err < 0 ? err : -EPROTO);
++		return sock_error(sk);
++	}
++	if (flags & O_NONBLOCK)
++		return -EINPROGRESS;
++wait:
++	timeo = tsi_host_connect_wait(tsk, sock_sndtimeo(sk, false));
++	if (tsi_host_connect_pending(tsk))
++		return signal_pending(current) ? sock_intr_errno(timeo) :
++						 -EINPROGRESS;
++	if (tsk->host_connect_phase != TSI_CONNECT_DONE) {
++		err = sock_error(sk);
++		sock->state = SS_UNCONNECTED;
++		return err ? err : -ECONNABORTED;
++	}
++	sock->state = SS_CONNECTED;
++	return 0;
++}
++
++/* A read/write issued before the handshake completes obeys its own timeout. */
++static int tsi_host_connect_io(struct tsi_sock *tsk, long timeo)
++{
++	struct sock *sk = sk_tsi(tsk);
++
++	timeo = tsi_host_connect_wait(tsk, timeo);
++	if (tsi_host_connect_pending(tsk))
++		return signal_pending(current) ? sock_intr_errno(timeo) : -EAGAIN;
++	if (tsk->host_connect_phase == TSI_CONNECT_FAILED) {
++		int err = sock_error(sk);
++
++		return err ? err : -ENOTCONN;
++	}
++	return 0;
++}
++
+ static int tsi_release(struct socket *sock)
+ {
+ 	struct tsi_sock *tsk;
+@@ -166,6 +394,7 @@
+ 	vsocket = tsk->vsocket;
+ 	sk = sock->sk;
+ 
++	tsi_host_connect_cancel(tsk);
+ 	lock_sock(sk);
+ 
+ 	pr_debug("%s: tsk=%p vsocket=%p isocket=%p\n", __func__, tsk, vsocket,
+@@ -196,6 +425,8 @@
+ 	sk->sk_shutdown = SHUTDOWN_MASK;
+ 	skb_queue_purge(&sk->sk_receive_queue);
+ 	release_sock(sk);
++	if (tsk->host_connect_socket)
++		sock_release(tsk->host_connect_socket);
+ 	kvfree(tsk->host_rx_data);
+ 	if (tsk->host_send_socket)
+ 		sock_release(tsk->host_send_socket);
+@@ -297,6 +528,11 @@
+ 	isocket = tsk->isocket;
+ 	vsocket = tsk->vsocket;
+ 
++	if (tsk->host_connect_phase) {
++		err = -EINVAL;
++		goto release;
++	}
++
+ 	pr_debug("%s: vsocket=%p\n", __func__, vsocket);
+ 
+ 	err = tsi_check_addr_len(tsk, addr_len);
+@@ -447,6 +683,11 @@
+ 	if (err != 0) {
+ 		pr_debug("%s: invalid addr_len: %d\n", __func__, addr_len);
+ 		err = -EINVAL;
++		goto release;
++	}
++
++	if (tsi_host_enabled(tsk) && sk->sk_type == SOCK_STREAM) {
++		err = tsi_host_connect_start(sock, addr, addr_len, flags);
+ 		goto release;
+ 	}
+ 
+@@ -886,6 +1127,11 @@
+ 	pr_debug("%s: s=%p is=%p st=%d svm_port=%u peer=%d\n", __func__, sock,
+ 		 isocket, tsk->status, tsk->svm_port, peer);
+ 
++	if (peer && tsk->host_connect_phase &&
++	    tsk->host_connect_phase != TSI_CONNECT_DONE) {
++		err = -ENOTCONN;
++		goto release;
++	}
+ 	if (tsi_host_enabled(tsk) && tsk->svm_port) {
+ 		err = vsock_proxy_getname(tsk, addr, peer);
+ 		goto release;
+@@ -1168,6 +1414,25 @@
+ 	pr_debug("%s: s=%p vs=%p is=%p st=%d\n", __func__, sock, vsocket,
+ 		 isocket, tsk->status);
+ 
++	if (tsk->host_connect_phase) {
++		sock_poll_wait(file, sock, wait);
++		if (tsi_host_connect_pending(tsk)) {
++			/* epoll installs wait entries only when registering the
++			 * fd. Keep the data transport in that initial registration
++			 * so later reads/writes still wake it after completion.
++			 */
++			vsocket->ops->poll(file, vsocket, wait);
++			goto out;
++		}
++		if (tsk->host_connect_phase == TSI_CONNECT_FAILED) {
++			events = EPOLLIN | EPOLLRDNORM | EPOLLOUT |
++				 EPOLLWRNORM | EPOLLHUP;
++			if (READ_ONCE(sk->sk_err))
++				events |= EPOLLERR;
++			goto out;
++		}
++	}
++
+ 	switch (tsk->status) {
+ 	case S_INET:
+ 		sock->sk->sk_err = isocket->sk->sk_err;
+@@ -1184,6 +1449,7 @@
+ 			tsk->status = S_VSOCK;
+ 	}
+ 
++out:
+ 	release_sock(sk);
+ 	return events;
+ }
+@@ -1238,6 +1504,11 @@
+ 	tsk = tsi_sk(sock->sk);
+ 	isocket = tsk->isocket;
+ 	vsocket = tsk->vsocket;
++
++	if (tsk->host_connect_phase) {
++		err = -EINVAL;
++		goto release;
++	}
+ 
+ 	pr_debug("%s: vsocket=%p\n", __func__, vsocket);
+ 
+@@ -1326,6 +1597,9 @@
+ 	struct socket *vsocket;
+ 	int err;
+ 
++	if (mode < SHUT_RD || mode > SHUT_RDWR)
++		return -EINVAL;
++
+ 	lock_sock(sk);
+ 	tsk = tsi_sk(sock->sk);
+ 	isocket = tsk->isocket;
+@@ -1334,6 +1608,19 @@
+ 	pr_debug("%s: s=%p vs=%p is=%p st=%d\n", __func__, sock, vsocket,
+ 		 isocket, tsk->status);
+ 
++	if (tsi_host_connect_pending(tsk)) {
++		struct tsi_proxy_release req = {
++			.svm_port = tsk->svm_port,
++			.svm_peer_port = tsk->svm_peer_port,
++		};
++
++		sock->state = SS_UNCONNECTED;
++		tsi_host_connect_finish(tsk, -ECONNRESET);
++		tsi_control_sendmsg(tsk->csocket, TSI_PROXY_RELEASE,
++				    &req, sizeof(req));
++		err = 0;
++		goto out;
++	}
+ 	switch (tsk->status) {
+ 	case S_HYBRID:
+ 		err = -ENOTCONN;
+@@ -1346,6 +1633,7 @@
+ 		break;
+ 	}
+ 
++out:
+ 	release_sock(sk);
+ 	return err;
+ }
+@@ -1382,6 +1670,14 @@
+ 			sock_set_flag(sk, SOCK_BROADCAST);
+ 		else
+ 			sock_reset_flag(sk, SOCK_BROADCAST);
++		break;
++	case SO_SNDTIMEO_OLD:
++	case SO_SNDTIMEO_NEW:
++		WRITE_ONCE(sk->sk_sndtimeo, READ_ONCE(src->sk_sndtimeo));
++		break;
++	case SO_RCVTIMEO_OLD:
++	case SO_RCVTIMEO_NEW:
++		WRITE_ONCE(sk->sk_rcvtimeo, READ_ONCE(src->sk_rcvtimeo));
+ 		break;
+ 	case SO_LINGER:
+ 		if (sock_flag(src, SOCK_LINGER))
+@@ -1568,6 +1864,12 @@
+ 	pr_debug("%s: s=%p vs=%p is=%p st=%d\n", __func__, sock, vsocket,
+ 		 isocket, tsk->status);
+ 
++	if (tsk->host_connect_phase) {
++		err = tsi_host_connect_io(tsk, sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT));
++		if (err)
++			goto out;
++	}
++
+ 	switch (tsk->status) {
+ 	case S_HYBRID:
+ 		err = -EINVAL;
+@@ -1582,6 +1884,7 @@
+ 		break;
+ 	}
+ 
++out:
+ 	release_sock(sk);
+ 	return err;
+ }
+@@ -1889,6 +2192,12 @@
+ 	pr_debug("%s: s=%p vs=%p is=%p st=%d\n", __func__, sock, vsocket,
+ 		 isocket, tsk->status);
+ 
++	if (tsk->host_connect_phase) {
++		err = tsi_host_connect_io(tsk, sock_rcvtimeo(sk, flags & MSG_DONTWAIT));
++		if (err)
++			goto out;
++	}
++
+ 	switch (tsk->status) {
+ 	case S_HYBRID:
+ 		err = -ENOTCONN;
+@@ -1901,6 +2210,7 @@
+ 		break;
+ 	}
+ 
++out:
+ 	release_sock(sk);
+ 	return err;
+ }
+--- a/net/tsi/af_tsi.h
++++ b/net/tsi/af_tsi.h
+@@ -10,6 +10,17 @@
+ 
+ #ifndef _AF_TSI_H_
+ #define _AF_TSI_H_
++
++#include <linux/workqueue.h>
++
++enum tsi_connect_phase {
++	TSI_CONNECT_IDLE,
++	TSI_CONNECT_HOST,
++	TSI_CONNECT_VSOCK,
++	TSI_CONNECT_DONE,
++	TSI_CONNECT_FAILED,
++	TSI_CONNECT_CLOSED,
++};
+ 
+ #define S_HYBRID           0
+ #define S_INET             1
+@@ -109,6 +120,12 @@
+ 	struct socket *isocket;
+ 	struct socket *vsocket;
+ 	struct socket *csocket;
++	struct socket *host_connect_socket;
++	struct work_struct host_connect_work;
++	wait_queue_entry_t host_connect_control_wait;
++	wait_queue_entry_t host_connect_vsock_wait;
++	enum tsi_connect_phase host_connect_phase;
++	bool host_connect_watched;
+ 	struct socket *host_send_socket;
+ 	u64 host_send_sequence;
+ 	unsigned int status;

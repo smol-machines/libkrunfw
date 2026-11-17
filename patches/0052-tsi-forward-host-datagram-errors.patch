@@ -1,0 +1,195 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: deliver asynchronous host datagram errors
+
+Forward host UDP errors to the application socket and wake blocking reads,
+poll and epoll, requiring a matching ABI 3 runtime.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -46,7 +46,7 @@
+ };
+ 
+ /* Selected by the VMM only with a matching host socket transport. */
+-static const char tsi_host_network_abi[] __used = "KRUN_TSI_HOST_NETWORK_ABI_2";
++static const char tsi_host_network_abi[] __used = "KRUN_TSI_HOST_NETWORK_ABI_3";
+ static bool tsi_host_network;
+ core_param(tsi_host_network, tsi_host_network, bool, 0);
+ 
+@@ -370,6 +370,24 @@
+ 	return 0;
+ }
+ 
++/* The private transport socket forwards errors onto the application socket.
++ * SO_ERROR, send and recv all consume that one outer error slot.
++ */
++static void tsi_host_dgram_error_report(struct sock *inner)
++{
++	struct sock *outer;
++	int error;
++
++	read_lock_bh(&inner->sk_callback_lock);
++	outer = rcu_dereference_sk_user_data(inner);
++	error = xchg(&inner->sk_err, 0);
++	if (outer && error) {
++		WRITE_ONCE(outer->sk_err, error);
++		sk_error_report(outer);
++	}
++	read_unlock_bh(&inner->sk_callback_lock);
++}
++
+ static int tsi_release(struct socket *sock)
+ {
+ 	struct tsi_sock *tsk;
+@@ -413,6 +431,11 @@
+ 					  (void *)&tpr,
+ 					  sizeof(struct tsi_proxy_release));
+ 
++		if (sock->type == SOCK_DGRAM && tsi_host_enabled(tsk)) {
++			write_lock_bh(&vsocket->sk->sk_callback_lock);
++			rcu_assign_sk_user_data(vsocket->sk, NULL);
++			write_unlock_bh(&vsocket->sk->sk_callback_lock);
++		}
+ 		sock_release(vsocket);
+ 	}
+ 
+@@ -1430,7 +1453,13 @@
+ 		sk->sk_err = isocket->sk->sk_err;
+ 	} else if (!tsi_dgram_reads_inet(tsk)) {
+ 		events = vmask;
+-		sk->sk_err = vsocket->sk->sk_err;
++		if (tsi_host_enabled(tsk)) {
++			sock_poll_wait(file, sock, wait);
++			if (READ_ONCE(sk->sk_err))
++				events |= EPOLLERR;
++		} else {
++			sk->sk_err = vsocket->sk->sk_err;
++		}
+ 	} else {
+ 		/* Writable through the inet half; readable from either. */
+ 		events = imask;
+@@ -2056,6 +2085,10 @@
+ 	int addr_len = msg->msg_namelen;
+ 	int err;
+ 	u64 sequence;
++
++	err = sock_error(sk_tsi(tsk));
++	if (err)
++		return err;
+ 
+ 	if (len > (tsk->family == AF_INET ? 65507 : 65527))
+ 		return -EMSGSIZE;
+@@ -2286,6 +2319,10 @@
+ 	int err, n;
+ 	__le16 family;
+ 
++	err = sock_error(sk_tsi(tsk));
++	if (err)
++		return err;
++
+ 	if (flags & (MSG_OOB | MSG_ERRQUEUE))
+ 		return -EOPNOTSUPP;
+ 	if (flags & MSG_DONTWAIT) {
+@@ -2450,6 +2487,7 @@
+ 	struct tsi_sock *tsk = tsi_sk(sk);
+ 	struct socket *isocket = tsk->isocket;
+ 	struct socket *vsocket = tsk->vsocket;
++	struct sock *error_sk = tsi_host_enabled(tsk) ? sk : isocket->sk;
+ 	struct tsi_dgram_waiter waiter;
+ 	bool inet_only, vsock_only;
+ 	long timeo;
+@@ -2466,7 +2504,7 @@
+ 	/* Errors queued by the guest's stack (IP_RECVERR) live there alone. */
+ 	if (inet_only || (flags & MSG_ERRQUEUE))
+ 		return isocket->ops->recvmsg(isocket, msg, len, flags);
+-	if (vsock_only)
++	if (vsock_only && !tsi_host_enabled(tsk))
+ 		return tsi_dgram_recv_vsock(tsk, msg, len, flags);
+ 
+ 	/*
+@@ -2482,15 +2520,19 @@
+ 	waiter.inet.private = &waiter;
+ 	init_waitqueue_func_entry(&waiter.vsock, tsi_dgram_wake);
+ 	waiter.vsock.private = &waiter;
+-	add_wait_queue(sk_sleep(isocket->sk), &waiter.inet);
++	add_wait_queue(sk_sleep(error_sk), &waiter.inet);
+ 	add_wait_queue(sk_sleep(vsocket->sk), &waiter.vsock);
+ 
+ 	for (;;) {
+-		err = isocket->ops->recvmsg(isocket, msg, len,
+-					    flags | MSG_DONTWAIT);
++		if (tsi_host_enabled(tsk))
++			err = tsi_dgram_recv_vsock(tsk, msg, len,
++						   flags | MSG_DONTWAIT);
++		else
++			err = isocket->ops->recvmsg(isocket, msg, len,
++						    flags | MSG_DONTWAIT);
+ 		if (err != -EAGAIN)
+ 			break;
+-		if (tsi_dgram_reads_vsock(tsk)) {
++		if (!tsi_host_enabled(tsk) && tsi_dgram_reads_vsock(tsk)) {
+ 			err = tsi_dgram_recv_vsock(tsk, msg, len,
+ 						   flags | MSG_DONTWAIT);
+ 			if (err != -EAGAIN)
+@@ -2510,7 +2552,7 @@
+ 	}
+ 
+ 	remove_wait_queue(sk_sleep(vsocket->sk), &waiter.vsock);
+-	remove_wait_queue(sk_sleep(isocket->sk), &waiter.inet);
++	remove_wait_queue(sk_sleep(error_sk), &waiter.inet);
+ 	return err;
+ }
+ 
+@@ -2636,6 +2678,13 @@
+ 	tsk->sendto_addr = NULL;
+ 	tsk->bound_addr = NULL;
+ 	tsk->family = family;
++	if (sock->type == SOCK_DGRAM && tsi_host_enabled(tsk)) {
++		write_lock_bh(&vsocket->sk->sk_callback_lock);
++		rcu_assign_sk_user_data(vsocket->sk, sk);
++		vsocket->sk->sk_error_report = tsi_host_dgram_error_report;
++		vsock_sk(vsocket->sk)->tsi_host_errors = true;
++		write_unlock_bh(&vsocket->sk->sk_callback_lock);
++	}
+ 
+ 	return 0;
+ 
+--- a/include/net/af_vsock.h
++++ b/include/net/af_vsock.h
+@@ -38,6 +38,8 @@
+ 	 * modified outsided of socket create or destruct.
+ 	 */
+ 	bool trusted;
++	/* Private TSI sockets accept host-originated datagram error controls. */
++	bool tsi_host_errors;
+ 	bool cached_peer_allow_dgram;	/* Dgram communication allowed to
+ 					 * cached peer?
+ 					 */
+--- a/net/vmw_vsock/virtio_transport_common.c
++++ b/net/vmw_vsock/virtio_transport_common.c
+@@ -1616,6 +1616,24 @@
+ static void
+ virtio_transport_recv_dgram(struct sock *sk, struct sk_buff *skb)
+ {
++	struct virtio_vsock_hdr *hdr = virtio_vsock_hdr(skb);
++	u32 error = le32_to_cpu(hdr->flags);
++
++	/* ABI 3 host UDP errors are controls, never empty user datagrams.
++	 * Ordinary vsock sockets retain their existing packet semantics.
++	 */
++	if (vsock_sk(sk)->tsi_host_errors &&
++	    le16_to_cpu(hdr->op) == VIRTIO_VSOCK_OP_RST) {
++		if (le64_to_cpu(hdr->src_cid) == VMADDR_CID_HOST &&
++		    le32_to_cpu(hdr->src_port) == 620 &&
++		    !le32_to_cpu(hdr->len) && error > 0 && error < 4096) {
++			WRITE_ONCE(sk->sk_err, error);
++			sk_error_report(sk);
++		}
++		kfree_skb(skb);
++		return;
++	}
++
+ 	if (sock_queue_rcv_skb(sk, skb)) {
+ 		kfree_skb(skb);
+ 		return;

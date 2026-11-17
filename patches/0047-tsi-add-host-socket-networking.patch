@@ -1,0 +1,577 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: route host-network sockets through the host transport
+
+Route host-network sockets through the VMM and acknowledge UDP sends
+with Linux errors.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include <linux/types.h>
++#include <linux/moduleparam.h>
+ #include <linux/poll.h>
+ #include <net/sock.h>
+ #include <net/af_unix.h>
+@@ -42,6 +43,16 @@
+ 	.obj_size = sizeof(struct tsi_sock),
+ };
+ 
++/* Selected by the VMM only with a matching host socket transport. */
++static bool tsi_host_network;
++core_param(tsi_host_network, tsi_host_network, bool, 0);
++
++static bool tsi_host_enabled(struct tsi_sock *tsk)
++{
++	return tsi_host_network &&
++	       (tsk->family == AF_INET || tsk->family == AF_INET6);
++}
++
+ #define tsi_sk(__sk) ((struct tsi_sock *)__sk)
+ #define sk_tsi(__tsk) (&(__tsk)->sk)
+ 
+@@ -185,6 +196,9 @@
+ 	sk->sk_shutdown = SHUTDOWN_MASK;
+ 	skb_queue_purge(&sk->sk_receive_queue);
+ 	release_sock(sk);
++	kvfree(tsk->host_rx_data);
++	if (tsk->host_send_socket)
++		sock_release(tsk->host_send_socket);
+ 	if (tsk->csocket)
+ 		sock_release(tsk->csocket);
+ 	kfree(tsk->bound_addr);
+@@ -196,6 +210,78 @@
+ 	return 0;
+ }
+ 
++static int tsi_create_proxy(struct tsi_sock *tsk, int type);
++
++/* Called with the outer socket locked; reserve the real host port first. */
++static int tsi_host_bind(struct tsi_sock *tsk, struct sockaddr *addr, int addr_len)
++{
++	struct tsi_host_bind_req req = { 0 };
++	struct tsi_getname_rsp rsp = { 0 };
++	struct sock *isk = tsk->isocket->sk;
++	struct sockaddr *bound;
++	int err;
++
++	if (tsk->bound_addr)
++		return -EINVAL;
++	if (addr->sa_family != tsk->family || tsi_check_addr_len(tsk, addr_len))
++		return -EINVAL;
++	addr_len = tsk->family == AF_INET ? sizeof(struct sockaddr_in) :
++					 sizeof(struct sockaddr_in6);
++	bound = kmalloc(addr_len, GFP_KERNEL);
++	if (!bound)
++		return -ENOMEM;
++	if (!tsk->svm_port) {
++		err = tsi_create_proxy(tsk, tsk->vsocket->type);
++		if (err)
++			goto fail;
++	}
++	req.svm_port = cpu_to_le32(tsk->svm_port);
++	req.addr_len = cpu_to_le32(addr_len);
++	req.options = cpu_to_le32((isk->sk_reuse ? 1 : 0) |
++				 (isk->sk_reuseport ? 2 : 0) |
++				 (ipv6_only_sock(isk) ? 4 : 0) |
++				 (sock_flag(isk, SOCK_BROADCAST) ? 8 : 0));
++	memcpy(req.addr, addr, addr_len);
++	err = tsi_control_sendmsg(tsk->csocket, TSI_BIND, &req, sizeof(req));
++	if (err < 0)
++		goto fail;
++	err = tsi_control_recvmsg(tsk->csocket, TSI_BIND, &rsp, sizeof(rsp));
++	if (err < 0)
++		goto fail;
++	if (err < sizeof(rsp)) {
++		err = -EPROTO;
++		goto fail;
++	}
++	if (rsp.result) {
++		err = rsp.result;
++		goto fail;
++	}
++	if (rsp.addr_len != addr_len ||
++	    ((struct sockaddr *)rsp.addr)->sa_family != tsk->family) {
++		err = -EPROTO;
++		goto fail;
++	}
++	memcpy(bound, rsp.addr, addr_len);
++	tsk->bound_addr = bound;
++	tsk->bound_addr_len = addr_len;
++	return 0;
++fail:
++	kfree(bound);
++	return err;
++}
++
++static int tsi_host_autobind(struct tsi_sock *tsk)
++{
++	struct sockaddr_storage addr = { 0 };
++
++	if (tsk->bound_addr)
++		return 0;
++	addr.ss_family = tsk->family;
++	return tsi_host_bind(tsk, (struct sockaddr *)&addr,
++			     tsk->family == AF_INET ? sizeof(struct sockaddr_in) :
++						      sizeof(struct sockaddr_in6));
++}
++
+ static int tsi_bind(struct socket *sock, struct sockaddr_unsized *addr,
+ 		    int addr_len)
+ {
+@@ -223,6 +309,11 @@
+ 	if (!isocket) {
+ 		pr_debug("%s: no isocket\n", __func__);
+ 		err = -EINVAL;
++		goto release;
++	}
++
++	if (tsi_host_enabled(tsk)) {
++		err = tsi_host_bind(tsk, (struct sockaddr *)addr, addr_len);
+ 		goto release;
+ 	}
+ 
+@@ -378,7 +469,7 @@
+ 	 * every address there makes it sort IPv6 first on an IPv4-only host,
+ 	 * and every name-based connection then goes somewhere unreachable.
+ 	 */
+-	if (sk->sk_type == SOCK_DGRAM && sock_net(sk) != &init_net) {
++	if (!tsi_host_enabled(tsk) && sk->sk_type == SOCK_DGRAM && sock_net(sk) != &init_net) {
+ 		if (isocket)
+ 			isocket->ops->connect(isocket, addr, addr_len,
+ 					      flags & ~O_NONBLOCK);
+@@ -397,7 +488,7 @@
+ 		goto release;
+ 	}
+ 
+-	if (isocket) {
++	if (isocket && !tsi_host_enabled(tsk)) {
+ 		/* We can't honor O_NONBLOCK semantics here as we need to know
+ 		 * whether this request can be fulfilled from INET or we need
+ 		 * to fall back to VSOCK.
+@@ -431,6 +522,11 @@
+ 		}
+ 	}
+ 
++	if (tsi_host_enabled(tsk) && sk->sk_type == SOCK_DGRAM) {
++		err = tsi_host_autobind(tsk);
++		if (err)
++			goto release;
++	}
+ 	if (vsocket) {
+ 		struct sockaddr_vm vm_addr;
+ 		struct tsi_connect_req tc_req;
+@@ -484,8 +580,10 @@
+ 		else
+ 			vm_addr.svm_port = TSI_DEFAULT_PORT;
+ 
+-		err = kernel_connect(vsocket, (struct sockaddr *)&vm_addr,
+-				     sizeof(struct sockaddr_vm), 0);
++		err = 0;
++		if (!(tsi_host_enabled(tsk) && sk->sk_type == SOCK_DGRAM))
++			err = kernel_connect(vsocket, (struct sockaddr *)&vm_addr,
++					     sizeof(struct sockaddr_vm), 0);
+ 		if (err < 0) {
+ 			pr_debug("%s: error connecting vsock endpoint: %d\n",
+ 				 __func__, err);
+@@ -678,6 +776,7 @@
+ 
+ 	newtsk = tsi_sk(newsock->sk);
+ 	mutex_init(&newtsk->accept_lock);
++	mutex_init(&newtsk->host_rx_lock);
+ 	newtsk->family = tsk->family;
+ 
+ 	if (tsk->status == S_INET) {
+@@ -787,6 +886,10 @@
+ 	pr_debug("%s: s=%p is=%p st=%d svm_port=%u peer=%d\n", __func__, sock,
+ 		 isocket, tsk->status, tsk->svm_port, peer);
+ 
++	if (tsi_host_enabled(tsk) && tsk->svm_port) {
++		err = vsock_proxy_getname(tsk, addr, peer);
++		goto release;
++	}
+ 	switch (tsk->status) {
+ 	case S_HYBRID:
+ 	case S_INET:
+@@ -832,6 +935,7 @@
+ 		break;
+ 	}
+ 
++release:
+ 	release_sock(sk);
+ 	return err;
+ }
+@@ -992,6 +1096,8 @@
+ /* Whether a datagram socket reads its inet half. */
+ static bool tsi_dgram_reads_inet(struct tsi_sock *tsk)
+ {
++	if (tsi_host_enabled(tsk))
++		return false;
+ 	/* Only a socket connected through the proxy reads the proxy alone. */
+ 	return !(tsk->status == S_VSOCK &&
+ 		 READ_ONCE(tsk->vsocket->state) == SS_CONNECTED);
+@@ -1036,6 +1142,8 @@
+ 			events |= vmask & (EPOLLIN | EPOLLRDNORM | EPOLLERR);
+ 		sk->sk_err = isocket->sk->sk_err;
+ 	}
++	if (tsi_host_enabled(tsk) && READ_ONCE(tsk->host_rx_ready))
++		events |= EPOLLIN | EPOLLRDNORM;
+ 	release_sock(sk);
+ 	return events;
+ }
+@@ -1133,6 +1241,11 @@
+ 
+ 	pr_debug("%s: vsocket=%p\n", __func__, vsocket);
+ 
++	if (tsi_host_enabled(tsk)) {
++		err = tsi_host_autobind(tsk);
++		if (err)
++			goto release;
++	}
+ 	err = vsocket->ops->listen(vsocket, backlog);
+ 	if (err != 0) {
+ 		pr_debug("%s: vsock listen error: %d\n", __func__, err);
+@@ -1186,7 +1299,8 @@
+ 
+ 	if (err == 0) {
+ 		tsk->svm_peer_port = TSI_DEFAULT_PORT;
+-	} else if (err == -EPERM || err == -EADDRINUSE || err == -EADDRNOTAVAIL) {
++	} else if (!tsi_host_enabled(tsk) &&
++		   (err == -EPERM || err == -EADDRINUSE || err == -EADDRNOTAVAIL)) {
+ 		/* Our peer is telling us we're not allowed to expose this
+ 		 * port. Switch to the INET personality.
+ 		 */
+@@ -1573,6 +1687,79 @@
+ 	return false;
+ }
+ 
++/* The outer socket lock serializes each address/data/ack transaction. */
++static int tsi_host_dgram_sendmsg(struct tsi_sock *tsk, struct msghdr *msg,
++				  size_t len)
++{
++	struct tsi_host_send_req req = { 0 };
++	struct tsi_host_send_rsp rsp;
++	struct sockaddr_vm destination = {
++		.svm_family = AF_VSOCK,
++		.svm_cid = VMADDR_CID_HOST,
++		.svm_port = TSI_SENDTO_DATA,
++	};
++	struct msghdr wire = *msg;
++	struct sockaddr *addr = msg->msg_name;
++	int addr_len = msg->msg_namelen;
++	int err;
++	u64 sequence;
++
++	if (len > (tsk->family == AF_INET ? 65507 : 65527))
++		return -EMSGSIZE;
++	if (!addr) {
++		addr = tsk->sendto_addr;
++		addr_len = tsk->sendto_addr_len;
++		if (!addr)
++			return -EDESTADDRREQ;
++	}
++	if (addr->sa_family != tsk->family || tsi_check_addr_len(tsk, addr_len))
++		return -EINVAL;
++	err = tsi_host_autobind(tsk);
++	if (err)
++		return err;
++	if (!tsk->host_send_socket) {
++		struct socket *reply_socket;
++
++		err = tsi_create_control_socket(&reply_socket);
++		if (err)
++			return err;
++		tsk->host_send_socket = reply_socket;
++	}
++	/*
++	 * A separate reply socket keeps an interrupted send's late result out
++	 * of subsequent bind/connect/getname replies. Sequence discards a late
++	 * send result when a later send uses this same reply socket.
++	 */
++	sequence = ++tsk->host_send_sequence;
++	req.svm_port = cpu_to_le32(tsk->svm_port);
++	req.addr_len = cpu_to_le32(addr_len);
++	req.sequence = cpu_to_le64(sequence);
++	memcpy(req.addr, addr, addr_len);
++	err = tsi_control_sendmsg(tsk->host_send_socket, TSI_HOST_SENDTO_ADDR,
++				  &req, sizeof(req));
++	if (err < 0)
++		return err;
++	wire.msg_name = &destination;
++	wire.msg_namelen = sizeof(destination);
++	err = tsk->vsocket->ops->sendmsg(tsk->vsocket, &wire, len);
++	msg->msg_iter = wire.msg_iter;
++	if (err < 0)
++		return err;
++	do {
++		err = tsi_control_recvmsg(tsk->host_send_socket,
++					  TSI_HOST_SENDTO_ADDR, &rsp,
++					  sizeof(rsp));
++		if (err < 0)
++			return err;
++		if (err != sizeof(rsp))
++			return -EPROTO;
++	} while (le64_to_cpu(rsp.sequence) != sequence);
++	err = (s32)le32_to_cpu(rsp.result);
++	if (err >= 0 && err != len)
++		return -EPROTO;
++	return err;
++}
++
+ static int tsi_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
+ 			     size_t len)
+ {
+@@ -1592,6 +1779,11 @@
+ 
+ 	pr_debug("%s: s=%p vs=%p is=%p st=%d family=%d\n", __func__, sock,
+ 		 vsocket, isocket, tsk->status, tsk->family);
++
++	if (tsi_host_enabled(tsk)) {
++		err = tsi_host_dgram_sendmsg(tsk, msg, len);
++		goto release;
++	}
+ 
+ 	/*
+ 	 * A hybrid connected datagram socket sends with no msg_name; supply the
+@@ -1602,7 +1794,8 @@
+ 	 * through the sendto flow, whose replies never reach the socket — the
+ 	 * agent's own resolver then times out and image pulls fail at boot.
+ 	 */
+-	if (tsk->status == S_HYBRID && !msg->msg_name && tsk->sendto_addr) {
++	if ((tsk->status == S_HYBRID || tsi_host_enabled(tsk)) &&
++	    !msg->msg_name && tsk->sendto_addr) {
+ 		memcpy(&connected_peer, tsk->sendto_addr, tsk->sendto_addr_len);
+ 		msg->msg_name = &connected_peer;
+ 		msg->msg_namelen = tsk->sendto_addr_len;
+@@ -1620,7 +1813,7 @@
+ 		 * through the proxy below. A socket connected through the proxy
+ 		 * sends without a name and keeps using its flow.
+ 		 */
+-		if (msg->msg_name &&
++		if (!tsi_host_enabled(tsk) && msg->msg_name &&
+ 		    tsi_dgram_via_guest(sk, msg->msg_name, msg->msg_namelen)) {
+ 			err = isocket->ops->sendmsg(isocket, msg, len);
+ 			break;
+@@ -1713,12 +1906,153 @@
+ }
+ 
+ /* Receive one datagram the proxy delivered, naming the peer it came from. */
++/* Receive complete host UDP datagrams without enlarging virtio RX buffers. */
++struct tsi_host_dgram_frame {
++	__le32 sequence;
++	__le32 total;
++	__le32 offset;
++	__le32 addr_len;
++	u8 addr[28];
++} __packed;
++
++static int tsi_host_dgram_recvmsg(struct tsi_sock *tsk, struct msghdr *msg,
++				  size_t len, int flags)
++{
++	struct tsi_host_dgram_frame frame, received;
++	struct msghdr wire_msg;
++	struct kvec vec[2];
++	u32 total, offset, addr_len, sequence;
++	size_t copied;
++	int err, n;
++	__le16 family;
++
++	if (flags & (MSG_OOB | MSG_ERRQUEUE))
++		return -EOPNOTSUPP;
++	if (flags & MSG_DONTWAIT) {
++		if (!mutex_trylock(&tsk->host_rx_lock))
++			return -EAGAIN;
++	} else if (mutex_lock_interruptible(&tsk->host_rx_lock)) {
++		return -ERESTARTSYS;
++	}
++
++	while (!tsk->host_rx_ready) {
++		/* Peek just the header, then receive into the final payload buffer.
++		 * Only this mutex-protected path consumes this private vsock, so
++		 * nothing can replace the peeked message before the receive below.
++		 */
++		memset(&wire_msg, 0, sizeof(wire_msg));
++		vec[0].iov_base = &frame;
++		vec[0].iov_len = sizeof(frame);
++		WRITE_ONCE(tsk->vsocket->sk->sk_rcvtimeo,
++			   READ_ONCE(tsk->isocket->sk->sk_rcvtimeo));
++		n = kernel_recvmsg(tsk->vsocket, &wire_msg, vec, 1,
++				   sizeof(frame), (flags & MSG_DONTWAIT) | MSG_PEEK);
++		if (n < 0) {
++			err = n;
++			goto out;
++		}
++		if (n != sizeof(frame))
++			goto invalid;
++		total = le32_to_cpu(frame.total);
++		offset = le32_to_cpu(frame.offset);
++		sequence = le32_to_cpu(frame.sequence);
++		addr_len = le32_to_cpu(frame.addr_len);
++		memcpy(&family, frame.addr, sizeof(family));
++		if (total > 65535 || offset > total ||
++		    !((le16_to_cpu(family) == AF_INET && addr_len == 16) ||
++		      (le16_to_cpu(family) == AF_INET6 && addr_len == 28)))
++			goto invalid;
++		if (!offset) {
++			if (tsk->host_rx_capacity < max_t(u32, total, 1)) {
++				u8 *data = kvmalloc(max_t(u32, total, 1), GFP_KERNEL);
++
++				if (!data) {
++					err = -ENOMEM;
++					goto out;
++				}
++				kvfree(tsk->host_rx_data);
++				tsk->host_rx_data = data;
++				tsk->host_rx_capacity = max_t(u32, total, 1);
++			}
++			tsk->host_rx_sequence = sequence;
++			tsk->host_rx_total = total;
++			tsk->host_rx_received = 0;
++			tsk->host_rx_addr_len = addr_len;
++			memcpy(tsk->host_rx_addr, frame.addr, addr_len);
++			tsk->host_rx_active = true;
++		}
++		if (!tsk->host_rx_active ||
++		    sequence != tsk->host_rx_sequence ||
++		    total != tsk->host_rx_total ||
++		    offset != tsk->host_rx_received ||
++		    addr_len != tsk->host_rx_addr_len ||
++		    memcmp(tsk->host_rx_addr, frame.addr, addr_len))
++			goto invalid;
++
++		memset(&wire_msg, 0, sizeof(wire_msg));
++		vec[0].iov_base = &received;
++		vec[0].iov_len = sizeof(received);
++		vec[1].iov_base = tsk->host_rx_data + offset;
++		vec[1].iov_len = total - offset;
++		n = kernel_recvmsg(tsk->vsocket, &wire_msg, vec, 2,
++				   sizeof(received) + total - offset, MSG_DONTWAIT);
++		if (n < 0) {
++			err = n;
++			goto out;
++		}
++		if (n < sizeof(received) || wire_msg.msg_flags & MSG_TRUNC ||
++		    memcmp(&frame, &received, sizeof(frame)) ||
++		    (n == sizeof(received) && total)) {
++			tsk->host_rx_active = false;
++			err = -EPROTO;
++			goto out;
++		}
++		tsk->host_rx_received += n - sizeof(received);
++		if (tsk->host_rx_received == total)
++			WRITE_ONCE(tsk->host_rx_ready, true);
++	}
++
++	copied = min_t(size_t, len, tsk->host_rx_total);
++	err = copied;
++	if (copied && copy_to_iter(tsk->host_rx_data, copied, &msg->msg_iter) != copied)
++		err = -EFAULT;
++	if (msg->msg_name) {
++		memcpy(msg->msg_name, tsk->host_rx_addr, tsk->host_rx_addr_len);
++		msg->msg_namelen = tsk->host_rx_addr_len;
++	}
++	if (copied < tsk->host_rx_total)
++		msg->msg_flags |= MSG_TRUNC;
++	if (err >= 0 && flags & MSG_TRUNC)
++		err = tsk->host_rx_total;
++	if (!(flags & MSG_PEEK)) {
++		WRITE_ONCE(tsk->host_rx_ready, false);
++		tsk->host_rx_active = false;
++	}
++	goto out;
++
++invalid:
++	/* Discard the offending frame, resetting a partial assembly. In
++	 * particular a missing fragment must never concatenate two senders.
++	 */
++	memset(&wire_msg, 0, sizeof(wire_msg));
++	vec[0].iov_base = &frame;
++	vec[0].iov_len = sizeof(frame);
++	kernel_recvmsg(tsk->vsocket, &wire_msg, vec, 1, sizeof(frame), MSG_DONTWAIT);
++	tsk->host_rx_active = false;
++	err = -EPROTO;
++out:
++	mutex_unlock(&tsk->host_rx_lock);
++	return err;
++}
++
+ static int tsi_dgram_recv_vsock(struct tsi_sock *tsk, struct msghdr *msg,
+ 				size_t len, int flags)
+ {
+ 	struct sock *sk = sk_tsi(tsk);
+ 	int err;
+ 
++	if (tsi_host_enabled(tsk))
++		return tsi_host_dgram_recvmsg(tsk, msg, len, flags);
+ 	err = tsk->vsocket->ops->recvmsg(tsk->vsocket, msg, len, flags);
+ 	if (err > 0 && msg && msg->msg_name) {
+ 		lock_sock(sk);
+@@ -1904,6 +2238,7 @@
+ 
+ 	tsk = tsi_sk(sk);
+ 	mutex_init(&tsk->accept_lock);
++	mutex_init(&tsk->host_rx_lock);
+ 
+ 	isocket = NULL;
+ 	err = __sock_create(current->nsproxy->net_ns, family, sock->type,
+--- a/net/tsi/af_tsi.h
++++ b/net/tsi/af_tsi.h
+@@ -25,8 +25,28 @@
+ #define TSI_LISTEN         1029
+ #define TSI_ACCEPT         1030
+ #define TSI_PROXY_RELEASE  1031
++#define TSI_BIND           1032
++#define TSI_HOST_SENDTO_ADDR 1033
+ 
+ #define TSI_ADDR_LEN       128
++
++struct tsi_host_send_req {
++	__le32 svm_port;
++	__le32 addr_len;
++	__le64 sequence;
++	u8 addr[TSI_ADDR_LEN];
++} __packed;
++struct tsi_host_send_rsp {
++	__le64 sequence;
++	__le32 result;
++} __packed;
++
++struct tsi_host_bind_req {
++	__le32 svm_port;
++	__le32 addr_len;
++	__le32 options;
++	u8 addr[TSI_ADDR_LEN];
++} __packed;
+ 
+ struct tsi_proxy_create {
+ 	u32 svm_port;
+@@ -89,6 +109,8 @@
+ 	struct socket *isocket;
+ 	struct socket *vsocket;
+ 	struct socket *csocket;
++	struct socket *host_send_socket;
++	u64 host_send_sequence;
+ 	unsigned int status;
+ 	u32 svm_port;
+ 	u32 svm_peer_port;
+@@ -97,6 +119,17 @@
+ 	 * it deadlocks concurrent shutdown()/close() on the listener).
+ 	 */
+ 	struct mutex accept_lock;
++	/* Serializes datagram reassembly and peek buffer ownership. */
++	struct mutex host_rx_lock;
++	u8 *host_rx_data;
++	u32 host_rx_capacity;
++	u32 host_rx_total;
++	u32 host_rx_received;
++	u32 host_rx_sequence;
++	u32 host_rx_addr_len;
++	u8 host_rx_addr[28];
++	bool host_rx_active;
++	bool host_rx_ready;
+ 	struct sockaddr *bound_addr;
+ 	struct sockaddr *sendto_addr;
+ 	int bound_addr_len;
