@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Prepare ABI tests: prepare.py <x86|arm> <old-kernel> <new-kernel> <output>.
 
-Old must lack the current host ABI marker; new includes patch 0056.
+Old must lack the current host ABI marker; new includes patch 0058.
 Use ELF vmlinux for x86 and raw Image for arm. Requires zstd on x86.
 Build guest.rs with rustc --edition=2021 --target <arch>-unknown-linux-musl.
 Compile launcher.c against the matching libkrun.h, link libdl on Linux,
@@ -25,7 +25,7 @@ def main():
     out = Path(output)
     out.mkdir(parents=True, exist_ok=True)
     old, new = Path(old).read_bytes(), Path(new).read_bytes()
-    marker = b"KRUN_TSI_HOST_NETWORK_ABI_6\0"
+    marker = b"KRUN_TSI_HOST_NETWORK_ABI_7\0"
     assert marker not in old
     assert new.count(marker) == 1
     for name, data in [("old", old), ("new", new)]:
@@ -35,7 +35,7 @@ def main():
         if arch == "x86":
             Path(str(path) + ".bz2").write_bytes(bz2.compress(data, compresslevel=1))
             subprocess.run(["zstd", "-q", "-1", "-f", str(path), "-o", str(path) + ".zst"], check=True)
-    (out / ("abi7-" + arch)).write_bytes(new.replace(marker, b"KRUN_TSI_HOST_NETWORK_ABI_7\0"))
+    (out / ("abi8-" + arch)).write_bytes(new.replace(marker, b"KRUN_TSI_HOST_NETWORK_ABI_8\0"))
     if arch == "x86":
         (out / "appended-x86").write_bytes(old + marker)
 

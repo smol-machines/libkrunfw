@@ -1,0 +1,135 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: preserve native stream close policy and deadlines
+
+Send close policy and a transport byte watermark to the host so aborts
+reset the connection and positive linger waits for native completion
+within the guest deadline.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -12,6 +12,8 @@
+ #include <linux/moduleparam.h>
+ #include <linux/poll.h>
+ #include <linux/workqueue.h>
++#include <linux/virtio_vsock.h>
++#include <linux/delay.h>
+ #include <net/tcp.h>
+ #include <net/sock.h>
+ #include <net/af_unix.h>
+@@ -46,7 +48,7 @@
+ };
+ 
+ /* Selected by the VMM only with a matching host socket transport. */
+-static const char tsi_host_network_abi[] __used = "KRUN_TSI_HOST_NETWORK_ABI_6";
++static const char tsi_host_network_abi[] __used = "KRUN_TSI_HOST_NETWORK_ABI_7";
+ static bool tsi_host_network;
+ core_param(tsi_host_network, tsi_host_network, bool, 0);
+ 
+@@ -388,6 +390,75 @@
+ 	read_unlock_bh(&inner->sk_callback_lock);
+ }
+ 
++/* The guest owns the close deadline; the host poll loop must never sleep in
++ * native SO_LINGER. Control and payload use distinct ports, so include the
++ * accepted byte watermark before asking the host to queue FIN.
++ */
++static void tsi_host_stream_close(struct tsi_sock *tsk)
++{
++	struct sock *sk = sk_tsi(tsk);
++	struct virtio_vsock_sock *vvs = vsock_sk(tsk->vsocket->sk)->trans;
++	struct tsi_host_close_req req = { 0 };
++	struct tsi_getname_rsp rsp;
++	struct sock *csk = tsk->csocket->sk;
++	long saved_recv = csk->sk_rcvtimeo, saved_send = csk->sk_sndtimeo;
++	unsigned long deadline;
++	long timeout = 0;
++	u32 flags = 0;
++	unsigned int delay = 1;
++	int err;
++
++	if (vvs) {
++		spin_lock_bh(&vvs->tx_lock);
++		req.tx_count = cpu_to_le32(vvs->tx_cnt);
++		spin_unlock_bh(&vvs->tx_lock);
++		spin_lock_bh(&vvs->rx_lock);
++		if (vvs->buf_used)
++			flags = TSI_CLOSE_ABORT;
++		spin_unlock_bh(&vvs->rx_lock);
++	}
++	if (sock_flag(sk, SOCK_LINGER)) {
++		if (!sk->sk_lingertime)
++			flags = TSI_CLOSE_ABORT;
++		else if (!(current->flags & PF_EXITING) && !flags)
++			timeout = sk->sk_lingertime;
++	}
++	if (timeout)
++		flags |= TSI_CLOSE_WAIT;
++	req.svm_port = cpu_to_le32(tsk->svm_port);
++	req.svm_peer_port = cpu_to_le32(tsk->svm_peer_port);
++	req.flags = cpu_to_le32(flags);
++	deadline = jiffies + timeout;
++	for (;;) {
++		if (timeout) {
++			WRITE_ONCE(csk->sk_rcvtimeo, timeout);
++			WRITE_ONCE(csk->sk_sndtimeo, timeout);
++		}
++		err = tsi_control_sendmsg(tsk->csocket, TSI_HOST_STREAM_CLOSE,
++					  &req, sizeof(req));
++		if (err != sizeof(req) || !timeout)
++			break;
++		if (time_after_eq(jiffies, deadline))
++			break;
++		timeout = deadline - jiffies;
++		WRITE_ONCE(csk->sk_rcvtimeo, timeout);
++		err = tsi_control_recvmsg(tsk->csocket, TSI_HOST_STREAM_CLOSE,
++					  &rsp, sizeof(rsp));
++		if (err != sizeof(rsp) || le32_to_cpu(rsp.result) != 1 ||
++		    signal_pending(current) || time_after_eq(jiffies, deadline))
++			break;
++		timeout = deadline - jiffies;
++		schedule_timeout_interruptible(min_t(long, timeout,
++						     msecs_to_jiffies(delay)));
++		if (signal_pending(current) || time_after_eq(jiffies, deadline))
++			break;
++		timeout = deadline - jiffies;
++		delay = min(delay * 2, 16U);
++	}
++	WRITE_ONCE(csk->sk_rcvtimeo, saved_recv);
++	WRITE_ONCE(csk->sk_sndtimeo, saved_send);
++}
++
+ static int tsi_release(struct socket *sock)
+ {
+ 	struct tsi_sock *tsk;
+@@ -423,6 +494,9 @@
+ 		pr_debug("%s: no vsocket\n", __func__);
+ 	} else {
+ 		struct tsi_proxy_release tpr;
++
++		if (sock->type == SOCK_STREAM && tsi_host_enabled(tsk))
++			tsi_host_stream_close(tsk);
+ 
+ 		tpr.svm_port = tsk->svm_port;
+ 		tpr.svm_peer_port = tsk->svm_peer_port;
+--- a/net/tsi/af_tsi.h
++++ b/net/tsi/af_tsi.h
+@@ -39,6 +39,17 @@
+ #define TSI_BIND           1032
+ #define TSI_HOST_SENDTO_ADDR 1033
+ #define TSI_HOST_SETSOCKOPT 1034
++#define TSI_HOST_STREAM_CLOSE 1035
++
++#define TSI_CLOSE_ABORT 1
++#define TSI_CLOSE_WAIT  2
++
++struct tsi_host_close_req {
++	__le32 svm_port;
++	__le32 svm_peer_port;
++	__le32 tx_count;
++	__le32 flags;
++} __packed;
+ 
+ #define TSI_ADDR_LEN       128
+ 

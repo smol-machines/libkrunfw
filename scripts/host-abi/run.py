@@ -67,8 +67,8 @@ def main():
                           {"SMOL_ABI_CMDLINE": command}, None))
     cases += [("old-host", "old", "host", {}, errno.EOPNOTSUPP),
               ("old-legacy", "old", "legacy", {}, None),
-              ("abi7-host", "abi7", "host", {}, errno.EOPNOTSUPP),
-              ("abi7-legacy", "abi7", "legacy", {}, None),
+              ("abi8-host", "abi8", "host", {}, errno.EOPNOTSUPP),
+              ("abi8-legacy", "abi8", "legacy", {}, None),
               ("port-map", "new", "host", {"SMOL_ABI_PORT_MAP": "1"}, errno.EINVAL)]
     if arch == "x86":
         cases.append(("appended-host", "appended", "host", {}, errno.EOPNOTSUPP))
@@ -77,7 +77,7 @@ def main():
         for version, expected in [("new", None), ("old", errno.EOPNOTSUPP)]:
             cases.append((version + "-" + suffix, version, "host",
                           {"SMOL_KERNEL_FORMAT": fmt, "suffix": "." + suffix}, expected))
-    for version in ["new", "old", "abi7"]:
+    for version in ["new", "old", "abi8"]:
         extra = flatten(artifacts / (version + "-" + arch), out / (version + ".raw"), arch)
         extra["SMOL_ABI_BUNDLE"] = "1"
         for mode in ["host", "legacy"]:
@@ -121,9 +121,9 @@ def main():
             if expected is None:
                 passed = code == 0 and ran and "HOST_ABI_VM_PASS mode=" + mode in log
             else:
-                message = "port publishing map" if expected == errno.EINVAL else "host-network ABI 6"
+                message = "port publishing map" if expected == errno.EINVAL else "host-network ABI 7"
                 passed = code == 2 and not ran and "krun_start_enter: -%d:" % expected in log and message in log
-            passed = passed and "RUNTIME_HOST_ABI=6" in log
+            passed = passed and "RUNTIME_HOST_ABI=7" in log
             results.append({"name": name, "passed": passed, "exit": code, "guest_ran": ran})
             print(name, "PASS" if passed else "FAIL", flush=True)
             (out / "result.json").write_text(json.dumps({"cases": results, "passed": all(r["passed"] for r in results),
