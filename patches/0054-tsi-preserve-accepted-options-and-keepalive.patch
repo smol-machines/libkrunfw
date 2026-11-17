@@ -1,0 +1,169 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: preserve accepted options and support TCP keepalive tuning
+
+Give accepted host sockets private Linux option state and address both
+transport ports when applying options, requiring host-network ABI 5.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -12,7 +12,7 @@
+ #include <linux/moduleparam.h>
+ #include <linux/poll.h>
+ #include <linux/workqueue.h>
+-#include <net/tcp_states.h>
++#include <net/tcp.h>
+ #include <net/sock.h>
+ #include <net/af_unix.h>
+ #include <net/af_vsock.h>
+@@ -46,7 +46,7 @@
+ };
+ 
+ /* Selected by the VMM only with a matching host socket transport. */
+-static const char tsi_host_network_abi[] __used = "KRUN_TSI_HOST_NETWORK_ABI_4";
++static const char tsi_host_network_abi[] __used = "KRUN_TSI_HOST_NETWORK_ABI_5";
+ static bool tsi_host_network;
+ core_param(tsi_host_network, tsi_host_network, bool, 0);
+ 
+@@ -1041,6 +1041,8 @@
+ 	return err;
+ }
+ 
++static int tsi_accept_options(struct tsi_sock *parent, struct tsi_sock *child);
++
+ static int tsi_accept(struct socket *sock, struct socket *newsock,
+ 		      struct proto_accept_arg *arg)
+ {
+@@ -1093,6 +1095,19 @@
+ 	mutex_init(&newtsk->host_rx_lock);
+ 	newtsk->family = tsk->family;
+ 
++	/* Every accepted socket needs its own option state and control channel. */
++	err = tsi_create_control_socket(&csocket);
++	if (err)
++		goto error;
++	newtsk->csocket = csocket;
++	if (tsi_host_enabled(tsk) && tsk->status != S_INET) {
++		lock_sock(listener);
++		err = tsi_accept_options(tsk, newtsk);
++		release_sock(listener);
++		if (err)
++			goto error;
++	}
++
+ 	if (tsk->status == S_INET) {
+ 		err = tsi_accept_inet(tsk, &nsock, arg);
+ 		if (err < 0) {
+@@ -1127,11 +1142,6 @@
+ 		newtsk->vsocket = nsock;
+ 	}
+ 
+-	err = tsi_create_control_socket(&csocket);
+-	if (err)
+-		goto error;
+-
+-	newtsk->csocket = csocket;
+ 	newsock->state = SS_CONNECTED;
+ 
+ 	return err;
+@@ -1750,14 +1760,6 @@
+ 		else
+ 			sock_reset_flag(sk, SOCK_BROADCAST);
+ 		break;
+-	case SO_SNDTIMEO_OLD:
+-	case SO_SNDTIMEO_NEW:
+-		WRITE_ONCE(sk->sk_sndtimeo, READ_ONCE(src->sk_sndtimeo));
+-		break;
+-	case SO_RCVTIMEO_OLD:
+-	case SO_RCVTIMEO_NEW:
+-		WRITE_ONCE(sk->sk_rcvtimeo, READ_ONCE(src->sk_rcvtimeo));
+-		break;
+ 	case SO_LINGER:
+ 		if (sock_flag(src, SOCK_LINGER))
+ 			sock_set_flag(sk, SOCK_LINGER);
+@@ -1784,6 +1786,39 @@
+ 	default:
+ 		break;
+ 	}
++}
++
++/* The host owns the accepted TCP transport; this private inet socket keeps
++ * Linux validation/query state. Never share the listener's mutable options.
++ * The caller holds the outer listener lock across this snapshot.
++ */
++static int tsi_accept_options(struct tsi_sock *parent, struct tsi_sock *child)
++{
++	static const int options[] = {
++		SO_REUSEADDR, SO_REUSEPORT, SO_KEEPALIVE, SO_BROADCAST,
++		SO_SNDTIMEO_OLD, SO_RCVTIMEO_OLD, SO_LINGER, SO_RCVBUF, SO_SNDBUF,
++	};
++	struct sock *src = parent->isocket->sk;
++	struct sock *dst;
++	int err, i;
++
++	err = sock_create_kern(sock_net(src), parent->family, SOCK_STREAM,
++			       IPPROTO_TCP, &child->isocket);
++	if (err)
++		return err;
++	dst = child->isocket->sk;
++	for (i = 0; i < ARRAY_SIZE(options); i++) {
++		tsi_mirror_sol_socket_field(dst, src, options[i]);
++		tsi_mirror_sol_socket_field(sk_tsi(child), src, options[i]);
++	}
++	tcp_sk(dst)->nonagle = tcp_sk(src)->nonagle;
++	tcp_sk(dst)->keepalive_time = tcp_sk(src)->keepalive_time;
++	tcp_sk(dst)->keepalive_intvl = tcp_sk(src)->keepalive_intvl;
++	tcp_sk(dst)->keepalive_probes = tcp_sk(src)->keepalive_probes;
++	inet_sk(dst)->uc_ttl = inet_sk(src)->uc_ttl;
++	if (parent->family == AF_INET6)
++		inet6_sk(dst)->hop_limit = inet6_sk(src)->hop_limit;
++	return 0;
+ }
+ 
+ /* The supported integer options are validated before changing either side.
+@@ -1804,7 +1839,9 @@
+ 	supported = (level == SOL_SOCKET &&
+ 		     (optname == SO_REUSEADDR || optname == SO_REUSEPORT ||
+ 		      optname == SO_BROADCAST || optname == SO_KEEPALIVE)) ||
+-		    (level == IPPROTO_TCP && optname == TCP_NODELAY &&
++		    (level == IPPROTO_TCP &&
++		     (optname == TCP_NODELAY || optname == TCP_KEEPIDLE ||
++		      optname == TCP_KEEPINTVL || optname == TCP_KEEPCNT) &&
+ 		     sk_tsi(tsk)->sk_type == SOCK_STREAM) ||
+ 		    (level == IPPROTO_IP && optname == IP_TTL) ||
+ 		    (level == IPPROTO_IPV6 && optname == IPV6_UNICAST_HOPS &&
+@@ -1826,6 +1863,15 @@
+ 			return -EINVAL;
+ 		if (copy_from_sockptr(&value, optval, sizeof(value)))
+ 			return -EFAULT;
++	}
++	if (level == IPPROTO_TCP) {
++		if ((optname == TCP_KEEPIDLE &&
++		     (value < 1 || value > MAX_TCP_KEEPIDLE)) ||
++		    (optname == TCP_KEEPINTVL &&
++		     (value < 1 || value > MAX_TCP_KEEPINTVL)) ||
++		    (optname == TCP_KEEPCNT &&
++		     (value < 1 || value > MAX_TCP_KEEPCNT)))
++			return -EINVAL;
+ 	}
+ 	*applied = value;
+ 	wire_value = value;
+@@ -1846,6 +1892,7 @@
+ 			return err;
+ 	}
+ 	req.svm_port = cpu_to_le32(tsk->svm_port);
++	req.svm_peer_port = cpu_to_le32(tsk->svm_peer_port);
+ 	req.level = cpu_to_le32(level);
+ 	req.option = cpu_to_le32(optname);
+ 	req.value = cpu_to_le32(wire_value);
+--- a/net/tsi/af_tsi.h
++++ b/net/tsi/af_tsi.h
+@@ -55,6 +55,7 @@
+ 
+ struct tsi_host_sockopt_req {
+ 	__le32 svm_port;
++	__le32 svm_peer_port;
+ 	__le32 level;
+ 	__le32 option;
+ 	__le32 value;

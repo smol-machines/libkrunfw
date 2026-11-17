@@ -1,0 +1,77 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: forward host UDP disconnect requests
+
+Carry AF_UNSPEC through the host control path and clear the default
+peer only after a successful response, requiring host-network ABI 2.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -46,7 +46,7 @@
+ };
+ 
+ /* Selected by the VMM only with a matching host socket transport. */
+-static const char tsi_host_network_abi[] __used = "KRUN_TSI_HOST_NETWORK_ABI_1";
++static const char tsi_host_network_abi[] __used = "KRUN_TSI_HOST_NETWORK_ABI_2";
+ static bool tsi_host_network;
+ core_param(tsi_host_network, tsi_host_network, bool, 0);
+ 
+@@ -645,6 +645,39 @@
+ 	return 0;
+ }
+ 
++static int tsi_host_dgram_disconnect(struct socket *sock)
++{
++	struct tsi_sock *tsk = tsi_sk(sock->sk);
++	struct tsi_connect_req req = { 0 };
++	struct tsi_connect_rsp rsp;
++	int err;
++
++	/* An unused UDP socket can be disconnected without allocating a proxy. */
++	if (tsk->svm_port) {
++		req.svm_port = tsk->svm_port;
++		req.addr_len = sizeof(sa_family_t);
++		err = tsi_control_sendmsg(tsk->csocket, TSI_CONNECT,
++					  &req, sizeof(req));
++		if (err < 0)
++			return err;
++		if (err != sizeof(req))
++			return -EPROTO;
++		err = tsi_control_recvmsg(tsk->csocket, TSI_CONNECT,
++					  &rsp, sizeof(rsp));
++		if (err < 0)
++			return err;
++		if (err != sizeof(rsp))
++			return -EPROTO;
++		if (rsp.result)
++			return rsp.result;
++	}
++	kfree(tsk->sendto_addr);
++	tsk->sendto_addr = NULL;
++	tsk->sendto_addr_len = 0;
++	sock->state = SS_UNCONNECTED;
++	return 0;
++}
++
+ static int tsi_connect(struct socket *sock, struct sockaddr *addr, int addr_len,
+ 		       int flags)
+ {
+@@ -670,6 +703,17 @@
+ 	if (tsk->status == S_INET && isocket) {
+ 		err = isocket->ops->connect(isocket, addr, addr_len, flags);
+ 		goto release;
++	}
++
++	if (tsi_host_enabled(tsk) && sk->sk_type == SOCK_DGRAM) {
++		if (addr_len < sizeof(addr->sa_family)) {
++			err = -EINVAL;
++			goto release;
++		}
++		if (addr->sa_family == AF_UNSPEC) {
++			err = tsi_host_dgram_disconnect(sock);
++			goto release;
++		}
+ 	}
+ 
+ 	if (addr->sa_family != tsk->family) {

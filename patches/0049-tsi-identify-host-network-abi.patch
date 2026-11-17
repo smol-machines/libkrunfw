@@ -1,0 +1,28 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: identify the host socket protocol in the kernel image
+
+Expose a retained marker so the runtime can validate the actual loaded
+kernel before enabling host networking.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -46,6 +46,7 @@
+ };
+ 
+ /* Selected by the VMM only with a matching host socket transport. */
++static const char tsi_host_network_abi[] __used = "KRUN_TSI_HOST_NETWORK_ABI_1";
+ static bool tsi_host_network;
+ core_param(tsi_host_network, tsi_host_network, bool, 0);
+ 
+@@ -2636,6 +2637,9 @@
+ {
+ 	int err;
+ 
++	if (tsi_host_network)
++		pr_info("%s\n", tsi_host_network_abi);
++
+ 	err = proto_register(&tsi_in4_proto, 1);
+ 	if (err) {
+ 		pr_err("Could not register tsi protocol\n");

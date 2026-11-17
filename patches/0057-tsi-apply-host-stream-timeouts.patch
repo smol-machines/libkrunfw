@@ -1,0 +1,56 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: keep host stream timeouts on the active transport
+
+Keep private Linux option state while applying read and write timeouts
+to the forwarding transport, including accepted children.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -1140,6 +1140,12 @@
+ 		newtsk->status = S_VSOCK;
+ 		pr_debug("%s: switching to VSOCK\n", __func__);
+ 		newtsk->vsocket = nsock;
++		if (tsi_host_enabled(newtsk)) {
++			WRITE_ONCE(nsock->sk->sk_rcvtimeo,
++				   READ_ONCE(newtsk->isocket->sk->sk_rcvtimeo));
++			WRITE_ONCE(nsock->sk->sk_sndtimeo,
++				   READ_ONCE(newtsk->isocket->sk->sk_sndtimeo));
++		}
+ 	}
+ 
+ 	newsock->state = SS_CONNECTED;
+@@ -2018,11 +2024,27 @@
+ 		optval = KERNEL_SOCKPTR(&applied);
+ 		optlen = sizeof(applied);
+ 	}
+-	/* The inet socket retains Linux option validation and query state. */
+-	if (tsi_host_enabled(tsk) && level != SOL_SOCKET) {
+-		err = isocket->ops->setsockopt ?
+-			isocket->ops->setsockopt(isocket, level, optname, optval, optlen) :
+-			-ENOPROTOOPT;
++	/* Keep host option validation and inherited state on the private inet
++	 * socket, while timeouts must also govern the active vsock transport.
++	 */
++	if (tsi_host_enabled(tsk)) {
++		if (level == SOL_SOCKET) {
++			err = sock_setsockopt(isocket, level, optname, optval, optlen);
++			if (!err) {
++				tsi_mirror_sol_socket_field(sk, isocket->sk, optname);
++				if (optname == SO_RCVTIMEO_OLD || optname == SO_RCVTIMEO_NEW ||
++				    optname == SO_SNDTIMEO_OLD || optname == SO_SNDTIMEO_NEW) {
++					lock_sock(tsk->vsocket->sk);
++					tsi_mirror_sol_socket_field(tsk->vsocket->sk,
++								    isocket->sk, optname);
++					release_sock(tsk->vsocket->sk);
++				}
++			}
++		} else {
++			err = isocket->ops->setsockopt ?
++				isocket->ops->setsockopt(isocket, level, optname, optval, optlen) :
++				-ENOPROTOOPT;
++		}
+ 		release_sock(sk);
+ 		return err;
+ 	}

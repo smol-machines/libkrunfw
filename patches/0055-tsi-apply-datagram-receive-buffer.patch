@@ -1,0 +1,31 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: apply datagram receive limits to the transport queue
+
+Use the validated Linux receive buffer limit on the vsock queue that
+actually holds proxied datagrams, including privileged buffer requests.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -2051,6 +2051,20 @@
+ 		break;
+ 	}
+ 
++	/* Datagrams are queued on the transport socket, not the outer TSI
++	 * socket. Copy the canonical Linux limit after validation succeeds;
++	 * shrinking it must retain packets already queued, as on native UDP.
++	 */
++	if (!err && tsi_host_enabled(tsk) && level == SOL_SOCKET &&
++	    (optname == SO_RCVBUF || optname == SO_RCVBUFFORCE)) {
++		struct sock *vsk = tsk->vsocket->sk;
++
++		lock_sock(vsk);
++		tsi_mirror_sol_socket_field(vsk, isocket->sk, optname);
++		vsk->sk_userlocks |= SOCK_RCVBUF_LOCK;
++		release_sock(vsk);
++	}
++
+ 	release_sock(sk);
+ 	return err;
+ }
