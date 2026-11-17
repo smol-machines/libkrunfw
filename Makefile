@@ -1,5 +1,6 @@
 KERNEL_VERSION = linux-6.18.60
-KERNEL_REMOTE = https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/snapshot/$(KERNEL_VERSION).tar.gz
+KERNEL_REMOTE = https://cdn.kernel.org/pub/linux/kernel/v6.x/$(KERNEL_VERSION).tar.xz
+KERNEL_SHA256 = 3c2f44ef6acc021a7ad444d9a2e6ec1ef488ff09368793d0004a6080f69d621e
 KERNEL_TARBALL = tarballs/$(KERNEL_VERSION).tar.xz
 KERNEL_SOURCES = $(KERNEL_VERSION)
 KERNEL_PATCHES = $(shell find patches/ -name "0*.patch" | sort)
@@ -106,7 +107,11 @@ all: $(KRUNFW_BINARY_$(OS))
 
 $(KERNEL_TARBALL):
 	@mkdir -p tarballs
-	curl -fL --retry 5 --retry-delay 5 --retry-all-errors $(KERNEL_REMOTE) -o $(KERNEL_TARBALL)
+	@set -e; trap 'rm -f "$@.partial"' EXIT; \
+		curl -fL --connect-timeout 15 --max-time 300 --retry 5 --retry-delay 5 \
+			--retry-all-errors $(KERNEL_REMOTE) -o "$@.partial"; \
+		printf '%s  %s\n' '$(KERNEL_SHA256)' "$@.partial" | shasum -a 256 -c -; \
+		mv "$@.partial" "$@"
 
 $(KERNEL_SOURCES): $(KERNEL_TARBALL)
 	tar xf $(KERNEL_TARBALL)
