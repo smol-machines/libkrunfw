@@ -1,0 +1,82 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: isolate blocking accept replies from listener control
+
+Give accept its own lazily allocated control socket so listener
+operations cannot consume its reply. Route responses to the requesting
+port and require host-network ABI 8 for that behavior.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -48,7 +48,7 @@
+ };
+ 
+ /* Selected by the VMM only with a matching host socket transport. */
+-static const char tsi_host_network_abi[] __used = "KRUN_TSI_HOST_NETWORK_ABI_7";
++static const char tsi_host_network_abi[] __used = "KRUN_TSI_HOST_NETWORK_ABI_8";
+ static bool tsi_host_network;
+ core_param(tsi_host_network, tsi_host_network, bool, 0);
+ 
+@@ -528,6 +528,8 @@
+ 	kvfree(tsk->host_rx_data);
+ 	if (tsk->host_send_socket)
+ 		sock_release(tsk->host_send_socket);
++	if (tsk->accept_socket)
++		sock_release(tsk->accept_socket);
+ 	if (tsk->csocket)
+ 		sock_release(tsk->csocket);
+ 	kfree(tsk->bound_addr);
+@@ -1058,6 +1060,7 @@
+ {
+ 	struct socket *socket = tsk->vsocket;
+ 	struct socket *nsock;
++	struct socket *control;
+ 	struct tsi_accept_req ta_req;
+ 	struct tsi_accept_rsp ta_rsp;
+ 	int err;
+@@ -1073,7 +1076,15 @@
+ 	 * close() stay callable while we block on the host.
+ 	 */
+ 	mutex_lock(&tsk->accept_lock);
+-	err = tsi_control_sendmsg(tsk->csocket, TSI_ACCEPT, (void *)&ta_req,
++	if (!tsk->accept_socket) {
++		err = tsi_create_control_socket(&control);
++		if (err) {
++			mutex_unlock(&tsk->accept_lock);
++			return err;
++		}
++		tsk->accept_socket = control;
++	}
++	err = tsi_control_sendmsg(tsk->accept_socket, TSI_ACCEPT, (void *)&ta_req,
+ 				  sizeof(struct tsi_accept_req));
+ 	if (err < 0) {
+ 		mutex_unlock(&tsk->accept_lock);
+@@ -1081,7 +1092,7 @@
+ 		return err;
+ 	}
+ 
+-	err = tsi_control_recvmsg(tsk->csocket, TSI_ACCEPT, (void *)&ta_rsp,
++	err = tsi_control_recvmsg(tsk->accept_socket, TSI_ACCEPT, (void *)&ta_rsp,
+ 				  sizeof(struct tsi_accept_rsp));
+ 	mutex_unlock(&tsk->accept_lock);
+ 	if (err < 0) {
+--- a/net/tsi/af_tsi.h
++++ b/net/tsi/af_tsi.h
+@@ -140,6 +140,7 @@
+ 	struct socket *isocket;
+ 	struct socket *vsocket;
+ 	struct socket *csocket;
++	struct socket *accept_socket;
+ 	struct socket *host_connect_socket;
+ 	struct work_struct host_connect_work;
+ 	wait_queue_entry_t host_connect_control_wait;
+@@ -151,7 +152,7 @@
+ 	unsigned int status;
+ 	u32 svm_port;
+ 	u32 svm_peer_port;
+-	/* Serializes the accept request/response pair on csocket without
++	/* Serializes the accept request/response pair on accept_socket without
+ 	 * holding the listener's sock lock across the blocking wait (holding
+ 	 * it deadlocks concurrent shutdown()/close() on the listener).
+ 	 */

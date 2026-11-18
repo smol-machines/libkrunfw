@@ -1,0 +1,261 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] net: notify the guest agent when TCP listeners change
+
+Expose coalesced root-only listener generations through a pollable proc
+file so app discovery can sleep between real listener changes. Notify
+after successful native/TSI listen and when listeners close or shut down.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+ MAINTAINERS | 6 ++++++
+ include/net/smolvm_listeners.h | 13 +++++++++++++
+ net/core/Makefile | 2 ++
+ net/core/smolvm_listeners.c | 117 ++++++++++++++++++++
+ net/ipv4/inet_connection_sock.c | 9 ++++++++-
+ net/tsi/af_tsi.c | 13 +++++++++++--
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -23747,6 +23747,12 @@
+ S:	Odd Fixes
+ F:	drivers/net/ethernet/smsc/smc91x.*
+ 
++SMOLVM LISTENER NOTIFICATIONS
++M:	binsquare <hebinsquared@gmail.com>
++S:	Maintained
++F:	include/net/smolvm_listeners.h
++F:	net/core/smolvm_listeners.c
++
+ SMSC EMC2103 HARDWARE MONITOR DRIVER
+ M:	Steve Glendinning <steve.glendinning@shawell.net>
+ L:	linux-hwmon@vger.kernel.org
+diff --git a/include/net/smolvm_listeners.h b/include/net/smolvm_listeners.h
+new file mode 100644
+--- /dev/null
++++ b/include/net/smolvm_listeners.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _NET_SMOLVM_LISTENERS_H
++#define _NET_SMOLVM_LISTENERS_H
++
++#include <linux/kconfig.h>
++
++#if IS_ENABLED(CONFIG_PROC_FS)
++void smolvm_listener_changed(void);
++#else
++static inline void smolvm_listener_changed(void) { }
++#endif
++
++#endif
+diff --git a/net/core/Makefile b/net/core/Makefile
+--- a/net/core/Makefile
++++ b/net/core/Makefile
+@@ -48,3 +48,5 @@
+ obj-$(CONFIG_NET_DEVMEM) += devmem.o
+ obj-$(CONFIG_DEBUG_NET) += lock_debug.o
+ obj-$(CONFIG_FAIL_SKB_REALLOC) += skb_fault_injection.o
++
++obj-$(CONFIG_PROC_FS) += smolvm_listeners.o
+diff --git a/net/core/smolvm_listeners.c b/net/core/smolvm_listeners.c
+new file mode 100644
+--- /dev/null
++++ b/net/core/smolvm_listeners.c
+@@ -0,0 +1,117 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Root-only, coalesced listener invalidation; no address or workload data.
++ * Each open descriptor receives an initial generation, then sleeps until a
++ * listener opens or closes. Ordinary connections and traffic never wake it.
++ */
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/poll.h>
++#include <linux/proc_fs.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <net/smolvm_listeners.h>
++
++static atomic64_t generation = ATOMIC64_INIT(0);
++static DECLARE_WAIT_QUEUE_HEAD(changed);
++
++struct listener_reader {
++	/* Serialize readers sharing one file descriptor and its cursor. */
++	struct mutex lock;
++	u64 seen;
++};
++
++static bool listener_pending(struct listener_reader *reader)
++{
++	return atomic64_read(&generation) != READ_ONCE(reader->seen);
++}
++
++void smolvm_listener_changed(void)
++{
++	atomic64_inc(&generation);
++	wake_up_interruptible_poll(&changed, EPOLLIN | EPOLLRDNORM);
++}
++EXPORT_SYMBOL_GPL(smolvm_listener_changed);
++
++static int listeners_open(struct inode *inode, struct file *file)
++{
++	struct listener_reader *reader;
++
++	reader = kzalloc(sizeof(*reader), GFP_KERNEL);
++	if (!reader)
++		return -ENOMEM;
++	mutex_init(&reader->lock);
++	reader->seen = atomic64_read(&generation) - 1;
++	file->private_data = reader;
++	return stream_open(inode, file);
++}
++
++static ssize_t listeners_read(struct file *file, char __user *buffer,
++			      size_t count, loff_t *position)
++{
++	struct listener_reader *reader = file->private_data;
++	__le64 value;
++	u64 sequence;
++	int error;
++
++	if (!count)
++		return 0;
++	if (count < sizeof(value))
++		return -EINVAL;
++	error = mutex_lock_interruptible(&reader->lock);
++	if (error)
++		return error;
++	for (;;) {
++		sequence = atomic64_read(&generation);
++		if (sequence != reader->seen)
++			break;
++		if (file->f_flags & O_NONBLOCK) {
++			error = -EAGAIN;
++			goto out;
++		}
++		error = wait_event_interruptible(changed, listener_pending(reader));
++		if (error)
++			goto out;
++	}
++	value = cpu_to_le64(sequence);
++	if (copy_to_user(buffer, &value, sizeof(value))) {
++		error = -EFAULT;
++		goto out;
++	}
++	/* A change during copy remains readable, rather than being consumed. */
++	WRITE_ONCE(reader->seen, sequence);
++	error = sizeof(value);
++out:
++	mutex_unlock(&reader->lock);
++	return error;
++}
++
++static __poll_t listeners_poll(struct file *file, poll_table *wait)
++{
++	struct listener_reader *reader = file->private_data;
++
++	poll_wait(file, &changed, wait);
++	if (atomic64_read(&generation) != READ_ONCE(reader->seen))
++		return EPOLLIN | EPOLLRDNORM;
++	return 0;
++}
++
++static int listeners_release(struct inode *inode, struct file *file)
++{
++	kfree(file->private_data);
++	return 0;
++}
++
++static const struct proc_ops listeners_ops = {
++	.proc_open = listeners_open,
++	.proc_read = listeners_read,
++	.proc_poll = listeners_poll,
++	.proc_release = listeners_release,
++};
++
++static int __init listeners_init(void)
++{
++	return proc_create("smolvm-listeners", 0400, NULL, &listeners_ops) ? 0 : -ENOMEM;
++}
++fs_initcall(listeners_init);
+diff --git a/net/ipv4/inet_connection_sock.c b/net/ipv4/inet_connection_sock.c
+--- a/net/ipv4/inet_connection_sock.c
++++ b/net/ipv4/inet_connection_sock.c
+@@ -9,6 +9,7 @@
+  * Authors:	See the TCP sources
+  */
+ 
++#include <net/smolvm_listeners.h>
+ #include <linux/module.h>
+ #include <linux/jhash.h>
+ 
+@@ -1370,8 +1371,12 @@
+ 		sk_dst_reset(sk);
+ 		err = sk->sk_prot->hash(sk);
+ 
+-		if (likely(!err))
++		if (likely(!err)) {
++			/* The port is assigned and the listener is discoverable. */
++			if (sk->sk_protocol == IPPROTO_TCP)
++				smolvm_listener_changed();
+ 			return 0;
++		}
+ 	}
+ 
+ 	inet_sk_set_state(sk, TCP_CLOSE);
+@@ -1549,6 +1554,8 @@
+ 		}
+ 	}
+ 	WARN_ON_ONCE(sk->sk_ack_backlog);
++	if (sk->sk_protocol == IPPROTO_TCP)
++		smolvm_listener_changed();
+ }
+ EXPORT_SYMBOL_GPL(inet_csk_listen_stop);
+ 
+diff --git a/net/tsi/af_tsi.c b/net/tsi/af_tsi.c
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -8,6 +8,7 @@
+  *  Sergio Lopez <slp@redhat.com>
+  */
+ 
++#include <net/smolvm_listeners.h>
+ #include <linux/types.h>
+ #include <linux/moduleparam.h>
+ #include <linux/poll.h>
+@@ -542,6 +543,10 @@
+ 
+ 	tsi_host_connect_cancel(tsk);
+ 	lock_sock(sk);
++	if (READ_ONCE(sk->sk_state) == TCP_LISTEN) {
++		WRITE_ONCE(sk->sk_state, TCP_CLOSE);
++		smolvm_listener_changed();
++	}
+ 
+ 	pr_debug("%s: tsk=%p vsocket=%p isocket=%p\n", __func__, tsk, vsocket,
+ 		 isocket);
+@@ -1806,8 +1811,10 @@
+ 
+ release:
+ 	/* SOL_SOCKET queries read the outer sock, not either TSI personality. */
+-	if (!err)
++	if (!err && READ_ONCE(sk->sk_state) != TCP_LISTEN) {
+ 		WRITE_ONCE(sk->sk_state, TCP_LISTEN);
++		smolvm_listener_changed();
++	}
+ 	release_sock(sk);
+ 	return err;
+ }
+@@ -1893,8 +1900,10 @@
+ 	}
+ 
+ out:
+-	if (!err && mode != SHUT_WR && READ_ONCE(sk->sk_state) == TCP_LISTEN)
++	if (!err && mode != SHUT_WR && READ_ONCE(sk->sk_state) == TCP_LISTEN) {
+ 		WRITE_ONCE(sk->sk_state, TCP_CLOSE);
++		smolvm_listener_changed();
++	}
+ 	release_sock(sk);
+ 	return err;
+ }

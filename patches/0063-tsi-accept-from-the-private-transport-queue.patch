@@ -1,0 +1,164 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: accept directly from the private transport queue
+
+Use the socket queue for accept waits, signals, nonblocking calls
+and receive timeouts instead of a control reply that can outlive an
+interrupted syscall. Wake stopped vsock listeners with EINVAL and
+remove the redundant per-listener control socket and mutex.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -584,8 +584,6 @@
+ 	kvfree(tsk->host_rx_data);
+ 	if (tsk->host_send_socket)
+ 		sock_release(tsk->host_send_socket);
+-	if (tsk->accept_socket)
+-		sock_release(tsk->accept_socket);
+ 	if (tsk->csocket)
+ 		sock_release(tsk->csocket);
+ 	kfree(tsk->bound_addr);
+@@ -1117,81 +1115,27 @@
+ {
+ 	struct socket *socket = tsk->vsocket;
+ 	struct socket *nsock;
+-	struct socket *control;
+-	struct tsi_accept_req ta_req;
+-	struct tsi_accept_rsp ta_rsp;
+ 	int err;
+-
+-	ta_req.svm_port = tsk->svm_port;
+-	ta_req.flags = arg->flags;
+-
+-	pr_debug("%s: sending accept request id=%u\n", __func__,
+-		 ta_req.svm_port);
+-
+-	/* Serialize the request/response pair against concurrent accepts;
+-	 * the listener's sock lock is NOT held here so that shutdown() and
+-	 * close() stay callable while we block on the host.
+-	 */
+-	mutex_lock(&tsk->accept_lock);
+-	if (!tsk->accept_socket) {
+-		err = tsi_create_control_socket(&control);
+-		if (err) {
+-			mutex_unlock(&tsk->accept_lock);
+-			return err;
+-		}
+-		tsk->accept_socket = control;
+-	}
+-	err = tsi_control_sendmsg(tsk->accept_socket, TSI_ACCEPT, (void *)&ta_req,
+-				  sizeof(struct tsi_accept_req));
+-	if (err < 0) {
+-		mutex_unlock(&tsk->accept_lock);
+-		pr_debug("%s: error sending accept request\n", __func__);
+-		return err;
+-	}
+-
+-	err = tsi_control_recvmsg(tsk->accept_socket, TSI_ACCEPT, (void *)&ta_rsp,
+-				  sizeof(struct tsi_accept_rsp));
+-	mutex_unlock(&tsk->accept_lock);
+-	if (err < 0) {
+-		pr_debug("%s: error receiving accept response\n", __func__);
+-		return err;
+-	}
+-
+-	pr_debug("%s: response result: %d\n", __func__, ta_rsp.result);
+-
+-	if (ta_rsp.result != 0) {
+-		return ta_rsp.result;
+-	}
+ 
+ 	nsock = sock_alloc();
+ 	if (!nsock)
+ 		return -ENOMEM;
+-
+ 	nsock->type = socket->type;
+ 	nsock->ops = socket->ops;
+ 
+-	/* The host reply follows the child handshake. Do not sleep on a queue
+-	 * that a concurrent listener shutdown may have drained in the meantime.
++	lock_sock(socket->sk);
++	WRITE_ONCE(socket->sk->sk_rcvtimeo, READ_ONCE(sk_tsi(tsk)->sk_rcvtimeo));
++	release_sock(socket->sk);
++
++	/* The host establishes children in this queue before notifying us.
++	 * Let the transport own blocking, signals, timeouts and queue locking;
++	 * a second control reply can outlive an interrupted accept syscall.
+ 	 */
+-	lock_sock(sk_tsi(tsk));
+-	if (READ_ONCE(sk_tsi(tsk)->sk_state) != TCP_LISTEN) {
+-		err = -EINVAL;
+-	} else {
+-		struct proto_accept_arg ready = *arg;
+-
+-		ready.flags |= O_NONBLOCK;
+-		err = socket->ops->accept(socket, nsock, &ready);
+-	}
+-	release_sock(sk_tsi(tsk));
+-
+-	if (err < 0) {
+-		pr_debug("%s: vsock accept failed: %d\n", __func__, err);
++	err = socket->ops->accept(socket, nsock, arg);
++	if (err < 0)
+ 		sock_release(nsock);
+-	} else {
+-		pr_debug("%s: connection accepted\n", __func__);
++	else
+ 		*newsock = nsock;
+-	}
+-
+ 	return err;
+ }
+ 
+@@ -1249,7 +1193,6 @@
+ 	set_bit(SOCK_CUSTOM_SOCKOPT, &sk->sk_socket->flags);
+ 
+ 	newtsk = tsi_sk(newsock->sk);
+-	mutex_init(&newtsk->accept_lock);
+ 	mutex_init(&newtsk->host_rx_lock);
+ 	newtsk->family = tsk->family;
+ 
+@@ -3156,7 +3099,6 @@
+ 	set_bit(SOCK_CUSTOM_SOCKOPT, &sk->sk_socket->flags);
+ 
+ 	tsk = tsi_sk(sk);
+-	mutex_init(&tsk->accept_lock);
+ 	mutex_init(&tsk->host_rx_lock);
+ 
+ 	isocket = NULL;
+--- a/net/tsi/af_tsi.h
++++ b/net/tsi/af_tsi.h
+@@ -142,7 +142,6 @@
+ 	struct socket *isocket;
+ 	struct socket *vsocket;
+ 	struct socket *csocket;
+-	struct socket *accept_socket;
+ 	bool listener_stopped;
+ 	struct socket *host_connect_socket;
+ 	struct work_struct host_connect_work;
+@@ -156,11 +155,6 @@
+ 	unsigned int status;
+ 	u32 svm_port;
+ 	u32 svm_peer_port;
+-	/* Serializes the accept request/response pair on accept_socket without
+-	 * holding the listener's sock lock across the blocking wait (holding
+-	 * it deadlocks concurrent shutdown()/close() on the listener).
+-	 */
+-	struct mutex accept_lock;
+ 	/* Serializes datagram reassembly and peek buffer ownership. */
+ 	struct mutex host_rx_lock;
+ 	u8 *host_rx_data;
+--- a/net/vmw_vsock/af_vsock.c
++++ b/net/vmw_vsock/af_vsock.c
+@@ -1989,6 +1989,10 @@
+ 		finish_wait(sk_sleep(listener), &wait);
+ 		lock_sock(listener);
+ 
++		if (listener->sk_state != TCP_LISTEN) {
++			err = -EINVAL;
++			goto out;
++		}
+ 		if (signal_pending(current)) {
+ 			err = sock_intr_errno(timeout);
+ 			goto out;

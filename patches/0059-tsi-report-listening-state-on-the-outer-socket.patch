@@ -1,0 +1,51 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: report listening state on the outer socket
+
+SO_ACCEPTCONN reads sk_state directly from the outer socket. A successful
+TSI listen only updates its inner socket, so callers cannot distinguish a
+listener from a bound socket. A local address query also shares the reply
+channel with blocking accept; return the resolved bind address locally so
+service discovery cannot steal an accept reply or stall behind it.
+
+Mirror successful listen and read shutdown
+on the outer state, retaining listener state across failed repeated listens
+and write-only shutdown.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -1293,6 +1293,14 @@
+ 	if (peer && tsk->host_connect_phase &&
+ 	    tsk->host_connect_phase != TSI_CONNECT_DONE) {
+ 		err = -ENOTCONN;
++		goto release;
++	}
++	/* A pending accept owns the control reply channel. The resolved local
++	 * bind address is already immutable while this socket is listening.
++	 */
++	if (!peer && READ_ONCE(sk->sk_state) == TCP_LISTEN && tsk->bound_addr) {
++		memcpy(addr, tsk->bound_addr, tsk->bound_addr_len);
++		err = tsk->bound_addr_len;
+ 		goto release;
+ 	}
+ 	if (tsi_host_enabled(tsk) && tsk->svm_port) {
+@@ -1754,6 +1762,9 @@
+ 	}
+ 
+ release:
++	/* SOL_SOCKET queries read the outer sock, not either TSI personality. */
++	if (!err)
++		WRITE_ONCE(sk->sk_state, TCP_LISTEN);
+ 	release_sock(sk);
+ 	return err;
+ }
+@@ -1803,6 +1814,8 @@
+ 	}
+ 
+ out:
++	if (!err && mode != SHUT_WR && READ_ONCE(sk->sk_state) == TCP_LISTEN)
++		WRITE_ONCE(sk->sk_state, TCP_CLOSE);
+ 	release_sock(sk);
+ 	return err;
+ }

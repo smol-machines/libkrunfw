@@ -1,0 +1,183 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: coordinate listener shutdown with the host proxy
+
+Stop accepting host connections and wake blocked accepts on read shutdown.
+Drain only unaccepted private vsock children and refresh the local address
+when listening again; leave accepted streams and write-only shutdown alone.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -1113,7 +1113,19 @@
+ 	nsock->type = socket->type;
+ 	nsock->ops = socket->ops;
+ 
+-	err = socket->ops->accept(socket, nsock, arg);
++	/* The host reply follows the child handshake. Do not sleep on a queue
++	 * that a concurrent listener shutdown may have drained in the meantime.
++	 */
++	lock_sock(sk_tsi(tsk));
++	if (READ_ONCE(sk_tsi(tsk)->sk_state) != TCP_LISTEN) {
++		err = -EINVAL;
++	} else {
++		struct proto_accept_arg ready = *arg;
++
++		ready.flags |= O_NONBLOCK;
++		err = socket->ops->accept(socket, nsock, &ready);
++	}
++	release_sock(sk_tsi(tsk));
+ 
+ 	if (err < 0) {
+ 		pr_debug("%s: vsock accept failed: %d\n", __func__, err);
+@@ -1149,6 +1161,10 @@
+ 	lock_sock(listener);
+ 	tsk = tsi_sk(sock->sk);
+ 	isocket = tsk->isocket;
++	if (READ_ONCE(listener->sk_state) != TCP_LISTEN) {
++		release_sock(listener);
++		return -EINVAL;
++	}
+ 
+ 	pr_debug("%s: socket=%p newsock=%p st=%d\n", __func__, sock, newsock,
+ 		 tsk->status);
+@@ -1309,7 +1325,8 @@
+ 	/* A pending accept owns the control reply channel. The resolved local
+ 	 * bind address is already immutable while this socket is listening.
+ 	 */
+-	if (!peer && READ_ONCE(sk->sk_state) == TCP_LISTEN && tsk->bound_addr) {
++	if (!peer && tsk->bound_addr &&
++	    (READ_ONCE(sk->sk_state) == TCP_LISTEN || tsk->listener_stopped)) {
+ 		memcpy(addr, tsk->bound_addr, tsk->bound_addr_len);
+ 		err = tsk->bound_addr_len;
+ 		goto release;
+@@ -1705,6 +1722,11 @@
+ 		if (err)
+ 			goto release;
+ 	}
++	if (tsk->listener_stopped) {
++		lock_sock(vsocket->sk);
++		WRITE_ONCE(vsocket->sk->sk_shutdown, 0);
++		release_sock(vsocket->sk);
++	}
+ 	err = vsocket->ops->listen(vsocket, backlog);
+ 	if (err != 0) {
+ 		pr_debug("%s: vsock listen error: %d\n", __func__, err);
+@@ -1758,6 +1780,14 @@
+ 
+ 	if (err == 0) {
+ 		tsk->svm_peer_port = TSI_DEFAULT_PORT;
++		if (tsk->listener_stopped) {
++			err = vsock_proxy_getname(tsk, tsk->bound_addr, 0);
++			if (err < 0)
++				goto release;
++			tsk->bound_addr_len = err;
++			tsk->listener_stopped = false;
++			err = 0;
++		}
+ 	} else if (!tsi_host_enabled(tsk) &&
+ 		   (err == -EPERM || err == -EADDRINUSE || err == -EADDRNOTAVAIL)) {
+ 		/* Our peer is telling us we're not allowed to expose this
+@@ -1780,6 +1810,31 @@
+ 	return err;
+ }
+ 
++static int tsi_stop_listener(struct tsi_sock *tsk, int mode)
++{
++	__le32 request[] = { cpu_to_le32(tsk->svm_port), cpu_to_le32(mode) };
++	struct tsi_getname_rsp response = { 0 };
++	int err;
++
++	if (mode == SHUT_WR)
++		return 0;
++	err = tsi_control_sendmsg(tsk->csocket, TSI_LISTENER_SHUTDOWN,
++				  request, sizeof(request));
++	if (err < 0)
++		return err;
++	err = tsi_control_recvmsg(tsk->csocket, TSI_LISTENER_SHUTDOWN,
++				  &response, sizeof(response));
++	if (err < 0)
++		return err;
++	if (err != sizeof(response))
++		return -EPROTO;
++	if (response.result)
++		return response.result;
++	vsock_stop_listener(tsk->vsocket);
++	tsk->listener_stopped = true;
++	return 0;
++}
++
+ static int tsi_shutdown(struct socket *sock, int mode)
+ {
+ 	struct sock *sk = sock->sk;
+@@ -1810,6 +1865,12 @@
+ 		tsi_control_sendmsg(tsk->csocket, TSI_PROXY_RELEASE,
+ 				    &req, sizeof(req));
+ 		err = 0;
++		goto out;
++	}
++	if (tsk->status != S_INET && sk->sk_type == SOCK_STREAM &&
++	    READ_ONCE(sk->sk_state) == TCP_LISTEN &&
++	    (tsk->family == AF_INET || tsk->family == AF_INET6)) {
++		err = tsi_stop_listener(tsk, mode);
+ 		goto out;
+ 	}
+ 	switch (tsk->status) {
+--- a/net/tsi/af_tsi.h
++++ b/net/tsi/af_tsi.h
+@@ -40,6 +40,7 @@
+ #define TSI_HOST_SENDTO_ADDR 1033
+ #define TSI_HOST_SETSOCKOPT 1034
+ #define TSI_HOST_STREAM_CLOSE 1035
++#define TSI_LISTENER_SHUTDOWN 1036
+ 
+ #define TSI_CLOSE_ABORT 1
+ #define TSI_CLOSE_WAIT  2
+@@ -141,6 +142,7 @@
+ 	struct socket *vsocket;
+ 	struct socket *csocket;
+ 	struct socket *accept_socket;
++	bool listener_stopped;
+ 	struct socket *host_connect_socket;
+ 	struct work_struct host_connect_work;
+ 	wait_queue_entry_t host_connect_control_wait;
+--- a/net/vmw_vsock/af_vsock.c
++++ b/net/vmw_vsock/af_vsock.c
+@@ -995,6 +995,27 @@
+ 	sock_put(sk);
+ }
+ 
++/* TSI read shutdown stops its private listener without releasing the socket.
++ * Accepted children have their own references and remain connected.
++ */
++void vsock_stop_listener(struct socket *sock)
++{
++	struct sock *sk = sock->sk;
++	struct sock *pending;
++
++	lock_sock(sk);
++	WRITE_ONCE(sk->sk_state, TCP_CLOSE);
++	WRITE_ONCE(sk->sk_shutdown, RCV_SHUTDOWN);
++	while ((pending = vsock_dequeue_accept(sk)) != NULL) {
++		sk_acceptq_removed(sk);
++		__vsock_release(pending, SINGLE_DEPTH_NESTING);
++		sock_put(pending);
++	}
++	sk->sk_state_change(sk);
++	release_sock(sk);
++}
++EXPORT_SYMBOL_GPL(vsock_stop_listener);
++
+ static void vsock_sk_destruct(struct sock *sk)
+ {
+ 	struct vsock_sock *vsk = vsock_sk(sk);
+--- a/include/net/af_vsock.h
++++ b/include/net/af_vsock.h
+@@ -225,6 +225,7 @@
+ void vsock_add_pending(struct sock *listener, struct sock *pending);
+ void vsock_remove_pending(struct sock *listener, struct sock *pending);
+ void vsock_enqueue_accept(struct sock *listener, struct sock *connected);
++void vsock_stop_listener(struct socket *sock);
+ void vsock_insert_connected(struct vsock_sock *vsk);
+ void vsock_remove_bound(struct vsock_sock *vsk);
+ void vsock_remove_connected(struct vsock_sock *vsk);
