@@ -1,0 +1,197 @@
+From: binsquare <hebinsquared@gmail.com>
+Subject: [PATCH] tsi: honor connection deadlines in legacy networking
+
+Use the asynchronous connection state machine for guest TCP attempts and
+host fallback so nonblocking connect and caller deadlines remain effective.
+Watch both transports for completion and cancel pending guest dials on
+shutdown.
+
+Signed-off-by: binsquare <hebinsquared@gmail.com>
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -149,7 +149,8 @@
+ /* The socket lock protects phases; transport waiters only queue short work. */
+ static bool tsi_host_connect_pending(struct tsi_sock *tsk)
+ {
+-	return tsk->host_connect_phase == TSI_CONNECT_HOST ||
++	return tsk->host_connect_phase == TSI_CONNECT_INET ||
++	       tsk->host_connect_phase == TSI_CONNECT_HOST ||
+ 	       tsk->host_connect_phase == TSI_CONNECT_VSOCK;
+ }
+ 
+@@ -170,6 +171,9 @@
+ 			  &tsk->host_connect_control_wait);
+ 	remove_wait_queue(sk_sleep(tsk->vsocket->sk),
+ 			  &tsk->host_connect_vsock_wait);
++	if (!tsi_host_enabled(tsk))
++		remove_wait_queue(sk_sleep(tsk->isocket->sk),
++				  &tsk->host_connect_inet_wait);
+ 	tsk->host_connect_watched = false;
+ }
+ 
+@@ -183,11 +187,26 @@
+ 		WRITE_ONCE(sk->sk_err, -err);
+ 		WRITE_ONCE(sk->sk_state, TCP_CLOSE);
+ 	} else {
++		tsk->status = tsk->host_connect_phase == TSI_CONNECT_INET ?
++			      S_INET : S_VSOCK;
+ 		tsk->host_connect_phase = TSI_CONNECT_DONE;
+-		tsk->status = S_VSOCK;
+ 		WRITE_ONCE(sk->sk_state, TCP_ESTABLISHED);
+ 	}
+ 	sk->sk_state_change(sk);
++}
++
++static int tsi_connect_host_request(struct tsi_sock *tsk)
++{
++	struct tsi_connect_req req = { 0 };
++	int err;
++
++	tsk->host_connect_phase = TSI_CONNECT_HOST;
++	req.svm_port = tsk->svm_port;
++	req.addr_len = tsk->sendto_addr_len;
++	memcpy(req.addr, tsk->sendto_addr, tsk->sendto_addr_len);
++	err = tsi_control_sendmsg(tsk->host_connect_socket, TSI_CONNECT,
++				  &req, sizeof(req));
++	return err == sizeof(req) ? 0 : (err < 0 ? err : -EPROTO);
+ }
+ 
+ static void tsi_host_connect_work(struct work_struct *work)
+@@ -205,6 +224,20 @@
+ 	int err;
+ 
+ 	lock_sock(sk);
++	if (tsk->host_connect_phase == TSI_CONNECT_INET) {
++		err = sock_error(tsk->isocket->sk);
++		if (!err && READ_ONCE(tsk->isocket->sk->sk_state) == TCP_ESTABLISHED) {
++			tsi_host_connect_finish(tsk, 0);
++			goto out;
++		}
++		if (!err && READ_ONCE(tsk->isocket->sk->sk_state) != TCP_CLOSE)
++			goto out;
++		err = tsi_connect_host_request(tsk);
++		if (err) {
++			tsi_host_connect_finish(tsk, err);
++			goto out;
++		}
++	}
+ 	if (tsk->host_connect_phase == TSI_CONNECT_HOST) {
+ 		err = kernel_recvmsg(tsk->host_connect_socket, &msg, &iov,
+ 				     1, sizeof(rsp), MSG_DONTWAIT);
+@@ -284,7 +317,7 @@
+ {
+ 	struct sock *sk = sock->sk;
+ 	struct tsi_sock *tsk = tsi_sk(sk);
+-	struct tsi_connect_req req = { 0 };
++	struct sockaddr *destination;
+ 	long timeo;
+ 	int err;
+ 
+@@ -306,6 +339,12 @@
+ 	}
+ 	if (tsk->status == S_VSOCK)
+ 		return -EISCONN;
++	destination = kmemdup(addr, addr_len, GFP_KERNEL);
++	if (!destination)
++		return -ENOMEM;
++	kfree(tsk->sendto_addr);
++	tsk->sendto_addr = destination;
++	tsk->sendto_addr_len = addr_len;
+ 	if (!tsk->svm_port) {
+ 		err = tsi_create_proxy(tsk, SOCK_STREAM);
+ 		if (err)
+@@ -327,19 +366,36 @@
+ 		       &tsk->host_connect_control_wait);
+ 	add_wait_queue(sk_sleep(tsk->vsocket->sk),
+ 		       &tsk->host_connect_vsock_wait);
++	if (!tsi_host_enabled(tsk)) {
++		init_waitqueue_func_entry(&tsk->host_connect_inet_wait,
++					  tsi_host_connect_wake);
++		tsk->host_connect_inet_wait.private = tsk;
++		add_wait_queue(sk_sleep(tsk->isocket->sk),
++			       &tsk->host_connect_inet_wait);
++	}
+ 	tsk->host_connect_watched = true;
+-	tsk->host_connect_phase = TSI_CONNECT_HOST;
+ 	sock->state = SS_CONNECTING;
+ 	WRITE_ONCE(sk->sk_state, TCP_SYN_SENT);
+-	req.svm_port = tsk->svm_port;
+-	req.addr_len = addr_len;
+-	memcpy(req.addr, addr, addr_len);
+-	err = tsi_control_sendmsg(tsk->host_connect_socket, TSI_CONNECT,
+-				  &req, sizeof(req));
+-	if (err != sizeof(req)) {
+-		tsi_host_connect_finish(tsk, err < 0 ? err : -EPROTO);
++	if (!tsi_host_enabled(tsk)) {
++		tsk->host_connect_phase = TSI_CONNECT_INET;
++		err = tsk->isocket->ops->connect(tsk->isocket, addr, addr_len,
++					      flags | O_NONBLOCK);
++		if (!err) {
++			tsi_host_connect_finish(tsk, 0);
++			goto started;
++		}
++		if (err == -EINPROGRESS || err == -EALREADY) {
++			schedule_work(&tsk->host_connect_work);
++			goto started;
++		}
++		sock_error(tsk->isocket->sk);
++	}
++	err = tsi_connect_host_request(tsk);
++	if (err) {
++		tsi_host_connect_finish(tsk, err);
+ 		return sock_error(sk);
+ 	}
++started:
+ 	if (flags & O_NONBLOCK)
+ 		return -EINPROGRESS;
+ wait:
+@@ -835,7 +891,8 @@
+ 		goto release;
+ 	}
+ 
+-	if (tsi_host_enabled(tsk) && sk->sk_type == SOCK_STREAM) {
++	if (sk->sk_type == SOCK_STREAM &&
++	    (tsk->family == AF_INET || tsk->family == AF_INET6)) {
+ 		err = tsi_host_connect_start(sock, addr, addr_len, flags);
+ 		goto release;
+ 	}
+@@ -1627,6 +1684,8 @@
+ 			 * so later reads/writes still wake it after completion.
+ 			 */
+ 			vsocket->ops->poll(file, vsocket, wait);
++			if (!tsi_host_enabled(tsk))
++				isocket->ops->poll(file, isocket, wait);
+ 			goto out;
+ 		}
+ 		if (tsk->host_connect_phase == TSI_CONNECT_FAILED) {
+@@ -1860,6 +1919,11 @@
+ 			.svm_peer_port = tsk->svm_peer_port,
+ 		};
+ 
++		/* A legacy dial may still be using the guest TCP stack. Stop
++		 * that attempt as well as the host proxy before reporting reset.
++		 */
++		if (tsk->host_connect_phase == TSI_CONNECT_INET)
++			isocket->ops->shutdown(isocket, SHUT_RDWR);
+ 		sock->state = SS_UNCONNECTED;
+ 		tsi_host_connect_finish(tsk, -ECONNRESET);
+ 		tsi_control_sendmsg(tsk->csocket, TSI_PROXY_RELEASE,
+--- a/net/tsi/af_tsi.h
++++ b/net/tsi/af_tsi.h
+@@ -15,6 +15,7 @@
+ 
+ enum tsi_connect_phase {
+ 	TSI_CONNECT_IDLE,
++	TSI_CONNECT_INET,
+ 	TSI_CONNECT_HOST,
+ 	TSI_CONNECT_VSOCK,
+ 	TSI_CONNECT_DONE,
+@@ -147,6 +148,7 @@
+ 	struct work_struct host_connect_work;
+ 	wait_queue_entry_t host_connect_control_wait;
+ 	wait_queue_entry_t host_connect_vsock_wait;
++	wait_queue_entry_t host_connect_inet_wait;
+ 	enum tsi_connect_phase host_connect_phase;
+ 	bool host_connect_watched;
+ 	struct socket *host_send_socket;

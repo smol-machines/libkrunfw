@@ -122,7 +122,9 @@ def main():
         endpoint = "[%s]:%d" if family == socket.AF_INET6 else "%s:%d"
         env["SMOL_TCP_INTERCEPT"] = endpoint % (intercept_ip, listener.getsockname()[1])
         env["SMOL_DNS_FORWARDER"] = "127.0.0.1:9"
-        env["SMOL_HOST_MODE"] = "host"
+        mode = env.get("SMOL_HOST_MODE", "host")
+        assert mode in ["host", "legacy"]
+        env["SMOL_HOST_MODE"] = mode
         try:
             with (out / "vm.log").open("w") as log:
                 run = subprocess.run(
@@ -142,9 +144,15 @@ def main():
             for worker in threads:
                 worker.join(timeout=7)
         content = (out / "vm.log").read_text()
+        loaded = [line[len("SMOL_RUNTIME_LIBRARY "):] for line in content.splitlines()
+                  if line.startswith("SMOL_RUNTIME_LIBRARY ")]
+        runtime_verified = (len(loaded) == 1 and Path(loaded[0]).resolve()
+                            == Path(env["SMOL_ASYNC_LIBRARY"]).resolve())
         result = {
+            "mode": mode,
+            "runtime_verified": runtime_verified,
             "exit": code,
-            "passed": code == 0 and "ASYNC_CONNECT_VM_PASS" in content
+            "passed": code == 0 and runtime_verified and "ASYNC_CONNECT_VM_PASS" in content
                       and len(records) == 50 and not errors,
             "guest_cases": [line for line in content.splitlines()
                             if line.startswith("ASYNC ")],
