@@ -1,0 +1,52 @@
+Subject: sched/fair: renew an overdue bandwidth period on the requesting CPU
+
+A virtual CPU can remain idle after its pinned bandwidth timer expires.
+If the requesting group has exhausted its global budget, finish that
+period under its bandwidth lock. Keep the original expiry sequence and
+let the timer callback handle groups with waiting runqueues.
+
+---
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -5823,6 +5823,30 @@
+ 	return &tg->cfs_bandwidth;
+ }
+ 
++/*
++ * A pinned period timer can be overdue on an idle vCPU. Let an active
++ * runqueue renew the expired period before it throttles. Leave existing
++ * waiters and any in-flight callback to the normal distribution path.
++ */
++static void refill_elapsed_period(struct cfs_bandwidth *cfs_b)
++{
++	struct hrtimer *timer = &cfs_b->period_timer;
++	u64 elapsed;
++
++	lockdep_assert_held(&cfs_b->lock);
++	if (!list_empty(&cfs_b->throttled_cfs_rq) ||
++	    hrtimer_expires_remaining(timer) > 0 ||
++	    hrtimer_try_to_cancel(timer) <= 0)
++		return;
++
++	elapsed = hrtimer_forward_now(timer, cfs_b->period);
++	if (elapsed) {
++		cfs_b->nr_periods += elapsed;
++		__refill_cfs_bandwidth_runtime(cfs_b);
++	}
++	hrtimer_start_expires(timer, HRTIMER_MODE_ABS_PINNED);
++}
++
+ /* returns 0 on failure to allocate runtime */
+ static int __assign_cfs_rq_runtime(struct cfs_bandwidth *cfs_b,
+ 				   struct cfs_rq *cfs_rq, u64 target_runtime)
+@@ -5839,6 +5863,9 @@
+ 	else {
+ 		start_cfs_bandwidth(cfs_b);
+ 
++		if (!cfs_b->runtime)
++			refill_elapsed_period(cfs_b);
++
+ 		if (cfs_b->runtime > 0) {
+ 			amount = min(cfs_b->runtime, min_amount);
+ 			cfs_b->runtime -= amount;
