@@ -1,0 +1,28 @@
+From: smolvm <noreply@smolmachines.com>
+Subject: [PATCH] fuse: let a submount be idmapped when its parent can be
+
+A FUSE superblock starts with SB_I_NOIDMAP, and the server's init reply clears
+it when the server allows idmapped mounts. A submount gets a superblock of its
+own that never sees an init reply, so it refuses idmapped mounts forever, even
+on a connection that allows them: mount_setattr(MOUNT_ATTR_IDMAP) fails with
+EINVAL for any directory virtio-fs announces as a submount (a host directory on
+another filesystem than its share's root). Inherit the parent's state instead.
+---
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -1736,6 +1736,15 @@
+ 	if (parent_sb->s_subtype && !sb->s_subtype)
+ 		return -ENOMEM;
+ 
++	/*
++	 * fuse_sb_defaults() refuses idmapped mounts until the server allows them
++	 * in its init reply, and only the connection's first superblock sees that
++	 * reply. A submount shares the connection, so it allows them when its
++	 * parent does.
++	 */
++	if (!(parent_sb->s_iflags & SB_I_NOIDMAP))
++		sb->s_iflags &= ~SB_I_NOIDMAP;
++
+ 	fuse_fill_attr_from_inode(&root_attr, parent_fi);
+ 	root = fuse_iget(sb, parent_fi->nodeid, 0, &root_attr, 0, 0,
+ 			 fuse_get_evict_ctr(fm->fc));
