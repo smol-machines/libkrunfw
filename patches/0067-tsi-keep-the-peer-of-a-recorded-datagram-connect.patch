@@ -1,0 +1,107 @@
+Subject: [PATCH] tsi: keep the peer of a recorded datagram connect
+
+Outside the initial network namespace a datagram connect() only records
+the peer, and each send without an address is given that peer so it can be
+routed per destination. The peer was supplied only while the socket was
+S_HYBRID, but the first send through the proxy moves it to S_VSOCK with
+its vsock half still unconnected. Every later send then reached the vsock
+transport with no destination and failed with EINVAL, and sendmmsg()
+stopped after one datagram. glibc sends the A and AAAA queries of a lookup
+that way, so getaddrinfo(AF_UNSPEC) failed in every container with its own
+network namespace.
+
+Supply the peer for every such send. Keep it apart from sendto_addr, which
+a sendto() to another address overwrites, so that send() still goes to the
+connected peer afterwards. Clear msg_name again before returning: it
+pointed at a local of this function, and sendmmsg() reads it after the
+call to remember the address it last used.
+---
+--- a/net/tsi/af_tsi.c
++++ b/net/tsi/af_tsi.c
+@@ -932,6 +932,8 @@
+ 			tsk->sendto_addr_len = addr_len;
+ 		}
+ 		memcpy(tsk->sendto_addr, addr, addr_len);
++		memcpy(&tsk->dgram_peer, addr, addr_len);
++		tsk->dgram_peer_len = addr_len;
+ 		tsk->status = S_HYBRID;
+ 		sock->state = SS_CONNECTED;
+ 		err = 0;
+@@ -2625,6 +2627,7 @@
+ 	struct tsi_sock *tsk;
+ 	struct socket *isocket;
+ 	struct socket *vsocket;
++	bool replayed = false;
+ 	int err;
+ 
+ 	lock_sock(sk);
+@@ -2641,19 +2644,23 @@
+ 	}
+ 
+ 	/*
+-	 * A hybrid connected datagram socket sends with no msg_name; supply the
+-	 * peer recorded at connect() time (on a private copy, since the vsock
++	 * A datagram socket whose connect() only recorded the peer sends with
++	 * no msg_name; supply that peer (on a private copy, since the vsock
+ 	 * proxy path rewrites msg_name in place) so the per-destination routing
+-	 * below has a target. Only for S_HYBRID: an S_VSOCK socket already has
+-	 * a connected proxy flow, and naming a peer here re-routes its sends
+-	 * through the sendto flow, whose replies never reach the socket — the
+-	 * agent's own resolver then times out and image pulls fail at boot.
++	 * below has a target. Every such send needs it, not only the first:
++	 * the first one through the proxy moves the socket to S_VSOCK, but its
++	 * vsock half stays unconnected and a datagram without an address has
++	 * nowhere to go. A socket connected through the proxy records no peer
++	 * here: it already has a connected proxy flow, and naming a peer
++	 * re-routes its sends through the sendto flow, whose replies never
++	 * reach the socket — the agent's own resolver then times out and image
++	 * pulls fail at boot.
+ 	 */
+-	if ((tsk->status == S_HYBRID || tsi_host_enabled(tsk)) &&
+-	    !msg->msg_name && tsk->sendto_addr) {
+-		memcpy(&connected_peer, tsk->sendto_addr, tsk->sendto_addr_len);
++	if (tsk->status != S_INET && tsk->dgram_peer_len && !msg->msg_name) {
++		memcpy(&connected_peer, &tsk->dgram_peer, tsk->dgram_peer_len);
+ 		msg->msg_name = &connected_peer;
+-		msg->msg_namelen = tsk->sendto_addr_len;
++		msg->msg_namelen = tsk->dgram_peer_len;
++		replayed = true;
+ 	}
+ 
+ 	switch (tsk->status) {
+@@ -2723,6 +2730,11 @@
+ 	}
+ 
+ release:
++	/* The caller reads msg_name again; connected_peer ends with this call. */
++	if (replayed) {
++		msg->msg_name = NULL;
++		msg->msg_namelen = 0;
++	}
+ 	release_sock(sk);
+ 	return err;
+ }
+@@ -3144,6 +3156,7 @@
+ 	tsk->svm_port = 0;
+ 	tsk->svm_peer_port = TSI_DEFAULT_PORT;
+ 	tsk->sendto_addr = NULL;
++	tsk->dgram_peer_len = 0;
+ 	tsk->bound_addr = NULL;
+ 	tsk->family = family;
+ 	if (sock->type == SOCK_STREAM && tsi_host_enabled(tsk))
+--- a/net/tsi/af_tsi.h
++++ b/net/tsi/af_tsi.h
+@@ -168,6 +168,13 @@
+ 	bool host_rx_ready;
+ 	struct sockaddr *bound_addr;
+ 	struct sockaddr *sendto_addr;
++	/*
++	 * Peer of a datagram socket whose connect() only recorded it: every
++	 * send without an address goes there. sendto_addr is the destination
++	 * of the last datagram, which sendto() may point somewhere else.
++	 */
++	struct sockaddr_storage dgram_peer;
++	int dgram_peer_len;
+ 	int bound_addr_len;
+ 	int sendto_addr_len;
+ 	u16 family;
